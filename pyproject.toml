@@ -22,4 +22,4 @@ include = ["CMakeLists.txt", "cmake", "src", "tools", "third_party"]
 [tool.py-build-cmake.cmake]
 minimum_version = "3.24"
 build_type = "Release"
-build_args = ["-j"]
+build_args = ["-j512"]

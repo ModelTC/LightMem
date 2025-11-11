@@ -17,3 +17,5 @@ wheels/
 *.so
 *.build
 *.log
+.py-build-cmake_cache/
+third_party/grpc/

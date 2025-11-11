@@ -3,14 +3,17 @@
 #include "core/error.h"
 #include "storage/base.h"
 
+#include <fcntl.h>
 #include <fstream>
 #include <list>
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
@@ -159,6 +162,7 @@ public:
     caches_.resize(shard_);
     locks_.resize(shard_);
     files_.resize(shard_);
+    file_fds_.resize(shard_, -1);
 
     for (size_t i = 0; i < shard_; i++) {
       caches_[i] = std::make_shared<LocalCacheIndex>(shard_capacity);
@@ -171,6 +175,10 @@ public:
     for (size_t i = 0; i < shard_; i++) {
       if (files_[i].is_open()) {
         files_[i].close();
+      }
+      if (file_fds_[i] >= 0) {
+        close(file_fds_[i]);
+        file_fds_[i] = -1;
       }
     }
   }
@@ -192,6 +200,12 @@ public:
     files_[shard_id].seekp(offset, std::ios::beg);
     files_[shard_id].write(buf, block_size_);
     files_[shard_id].flush();
+
+    // 立即丢弃新写入的页缓存，避免污染读缓存
+    if (file_fds_[shard_id] >= 0) {
+      posix_fadvise(file_fds_[shard_id], offset, block_size_, POSIX_FADV_DONTNEED);
+    }
+
     return block_size_;
   }
 
@@ -235,6 +249,8 @@ private:
       std::stringstream ss;
       ss << filename_ << "_" << i;
       std::string shard_filename = ss.str();
+      
+      // 打开 fstream 用于读写
       files_[i].open(shard_filename, std::ios::binary | std::ios::in | std::ios::out | std::ios::trunc);
       if (!files_[i].is_open()) {
         throw std::runtime_error("Failed to open file: " + shard_filename);
@@ -242,6 +258,12 @@ private:
       files_[i].seekp(shard_storage_size - 1, std::ios::beg);
       files_[i].write("", 1);
       files_[i].seekp(0, std::ios::beg);
+
+      // 同时打开原生 fd 用于 posix_fadvise
+      file_fds_[i] = open(shard_filename.c_str(), O_RDWR);
+      if (file_fds_[i] < 0) {
+        throw std::runtime_error("Failed to open native fd for: " + shard_filename);
+      }
     }
   }
 
@@ -250,6 +272,7 @@ private:
   size_t shard_;
   size_t block_size_;
   std::vector<std::fstream> files_;
+  std::vector<int> file_fds_;  ///< 原生文件描述符，用于 posix_fadvise
   std::vector<std::shared_ptr<std::mutex>> locks_;
   std::vector<std::shared_ptr<LocalCacheIndex>> caches_;
 };

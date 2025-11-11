@@ -197,12 +197,6 @@ protected:
     }
 
     const auto now = std::chrono::steady_clock::now();
-    if (read_last_log_time_ != std::chrono::steady_clock::time_point{}) {
-      const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - read_last_log_time_);
-      if (elapsed < std::chrono::seconds(3)) {
-        return;
-      }
-    }
 
     const uint64_t previous_read = read_last_logged_bytes_;
     const uint64_t delta_read = (total_read >= previous_read) ? (total_read - previous_read) : 0;
@@ -234,9 +228,11 @@ protected:
       return;
     }
 
+    const double delta_read_gb = static_cast<double>(delta_read) / (1024.0 * 1024.0 * 1024.0);
+    
     read_last_log_time_ = now;
     read_last_logged_bytes_ = total_read;
-    printf("[kvcache] read speed: %.2f GB/s\n", speed_gbps);
+    printf("[kvcache] read size: %.2f GB, read speed: %.2f GB/s\n", delta_read_gb, speed_gbps);
   }
 
 private:
