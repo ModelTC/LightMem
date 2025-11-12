@@ -126,12 +126,9 @@ public:
 protected:
   void on_task_finalized(cache::task::CacheTask *task) override {
     if (task->mode == cache::task::Mode::Write) {
-      if (active_write_creates_.load(std::memory_order_relaxed) != 0) {
-        return;
-      }
-
-      std::lock_guard<std::mutex> guard(log_mutex_);
-      if (active_write_creates_.load(std::memory_order_relaxed) != 0) {
+      // Try to acquire the lock, skip logging if contention occurs
+      std::unique_lock<std::mutex> guard(log_mutex_, std::try_to_lock);
+      if (!guard.owns_lock()) {
         return;
       }
 
@@ -187,9 +184,6 @@ protected:
     }
 
     std::lock_guard<std::mutex> guard(read_log_mutex_);
-    if (active_read_creates_.load(std::memory_order_relaxed) != 0) {
-      return;
-    }
 
     const uint64_t total_read = total_read_bytes_.load(std::memory_order_relaxed);
     if (total_read == 0) {
@@ -198,6 +192,7 @@ protected:
 
     const auto now = std::chrono::steady_clock::now();
 
+    // Calculate batch read amount (since last queue empty)
     const uint64_t previous_read = read_last_logged_bytes_;
     const uint64_t delta_read = (total_read >= previous_read) ? (total_read - previous_read) : 0;
     if (delta_read == 0) {
@@ -230,9 +225,12 @@ protected:
 
     const double delta_read_gb = static_cast<double>(delta_read) / (1024.0 * 1024.0 * 1024.0);
     
+    // Reset counters for next batch after queue is empty
     read_last_log_time_ = now;
-    read_last_logged_bytes_ = total_read;
-    printf("[kvcache] read size: %.2f GB, read speed: %.2f GB/s\n", delta_read_gb, speed_gbps);
+    read_last_logged_bytes_ = 0;  // Reset to 0 instead of total_read
+    total_read_bytes_.store(0, std::memory_order_relaxed);  // Clear accumulated bytes
+    first_read_time_ticks_.store(0, std::memory_order_relaxed);  // Reset timing
+    printf("[kvcache] batch read size: %.2f GB, read speed: %.2f GB/s\n", delta_read_gb, speed_gbps);
   }
 
 private:
@@ -315,7 +313,14 @@ private:
       }
     }
 
+    // Step 1: Gather data from KV cache to temporary buffer
     cpu_gather(this->cache_info_, cpu_buffer, page_ptr, num_of_page);
+
+    // Critical optimization: Mark data as ready immediately after gather completes
+    // This allows Python layer to release pages without waiting for disk I/O
+    block->task->num_data_ready_blocks.fetch_add(1, std::memory_order_release);
+
+    // Step 2: Write to disk (this happens asynchronously and doesn't block page release)
     const size_t written = storage_->write(cpu_buffer, block->hash);
     if (written != block_size_) {
       return false;

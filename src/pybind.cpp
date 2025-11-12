@@ -26,6 +26,7 @@ PYBIND11_MODULE(MODULE_NAME, m) {
 
   py::class_<CacheTask, std::shared_ptr<CacheTask>>(m, "Task")
       .def("ready", &CacheTask::ready, "Check if task is ready")
+      .def("data_safe", &CacheTask::data_safe, "Check if data is safe (for write mode: data copied from KV cache)")
       .def("state", &CacheTask::state, "Get task block states");
 
   py::class_<LocalCacheService>(m, "LocalCacheService")

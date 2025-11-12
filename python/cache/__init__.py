@@ -49,6 +49,13 @@ class PyTask:
         """ ready 函数用来询问任务是否完成执行 """
         return self._c.ready()
 
+    def data_safe(self) -> bool:
+        """ data_safe 函数用来询问数据是否已经安全可以释放页面
+        对于写模式：数据已从 KV cache 拷贝完成，页面可以安全释放（无需等待磁盘写入完成）
+        对于读模式：等同于 ready()
+        """
+        return self._c.data_safe()
+
     def state(self) -> List[PyState]:
         """ state 函数用来询问所有任务块的执行情况 """
         return [self._state_convert[s] for s in self._c.state()]

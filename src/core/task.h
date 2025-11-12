@@ -52,7 +52,8 @@ public:
   /// @param hashs Hash sequence.
   /// @param mode_str Mode string: "r" for Read, "w" for Write
   CacheTask(const std::vector<std::string> &hashs, torch::Tensor kv_page_indexer, const std::string &mode_str)
-      : num_finished_blocks(0), page_indexer(std::move(kv_page_indexer)), completion_notified(false) {
+      : num_finished_blocks(0), num_data_ready_blocks(0), page_indexer(std::move(kv_page_indexer)), 
+        completion_notified(false) {
 
     if (mode_str == "r") {
       mode = Mode::Read;
@@ -80,6 +81,16 @@ public:
 
   bool ready() const { return num_finished_blocks == blocks.size(); }
 
+  /// @brief Check if data is safe to release pages (for write mode)
+  /// For write mode: returns true when data has been copied from KV cache
+  /// For read mode: equivalent to ready()
+  bool data_safe() const {
+    if (mode == Mode::Write) {
+      return num_data_ready_blocks.load(std::memory_order_acquire) >= static_cast<int64_t>(blocks.size());
+    }
+    return ready(); // For read mode, data_safe is same as ready
+  }
+
   bool mark_completion_notified() { return !completion_notified.exchange(true, std::memory_order_acq_rel); }
 
   std::vector<State> state() {
@@ -96,6 +107,7 @@ public:
   std::mutex lock;                  ///< Task state lock
   std::vector<CacheBlock *> blocks; ///< Blocks stored as shared_ptr
   int64_t num_finished_blocks;
+  std::atomic<int64_t> num_data_ready_blocks; ///< Number of blocks with data copied (for write mode)
   Mode mode; ///< Read/write mode of the task.
   std::atomic<bool> completion_notified;
 };
