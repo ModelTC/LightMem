@@ -322,16 +322,18 @@ private:
 
     // Step 2: Write to disk (this happens asynchronously and doesn't block page release)
     const size_t written = storage_->write(cpu_buffer, block->hash);
-    if (written != block_size_) {
+    if (written != block_size_ && written != 0) {
       return false;
     }
-    total_written_bytes_.fetch_add(static_cast<uint64_t>(written), std::memory_order_relaxed);
-    if (first_write_time_ticks_.load(std::memory_order_relaxed) == 0) {
-      const auto now_duration = std::chrono::steady_clock::now().time_since_epoch();
-      const int64_t now_ticks = static_cast<int64_t>(now_duration.count());
-      int64_t expected = 0;
-      first_write_time_ticks_.compare_exchange_strong(expected, now_ticks, std::memory_order_relaxed,
-                                                      std::memory_order_relaxed);
+    if (written == block_size_) {
+      total_written_bytes_.fetch_add(static_cast<uint64_t>(written), std::memory_order_relaxed);
+      if (first_write_time_ticks_.load(std::memory_order_relaxed) == 0) {
+        const auto now_duration = std::chrono::steady_clock::now().time_since_epoch();
+        const int64_t now_ticks = static_cast<int64_t>(now_duration.count());
+        int64_t expected = 0;
+        first_write_time_ticks_.compare_exchange_strong(expected, now_ticks, std::memory_order_relaxed,
+                                                        std::memory_order_relaxed);
+      }
     }
     return true;
   }

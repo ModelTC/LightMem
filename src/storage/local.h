@@ -196,9 +196,9 @@ public:
     (void)evicted_hash;
 
     // 如果hash已存在（is_new为false），跳过实际的磁盘写入操作
-    // 直接返回block_size表示"写入成功"，实现前缀去重
+    // 返回 0 以便调用方能够感知到这次写入是被去重跳过的
     if (!is_new) {
-      return block_size_;
+      return 0;
     }
 
     // 只有新hash才执行实际的磁盘写入
