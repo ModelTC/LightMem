@@ -192,9 +192,16 @@ public:
     size_t shard_id = getShard(hash);
     size_t slot = 0;
     std::string evicted_hash;
-    caches_[shard_id]->checkout_slot(hash, slot, evicted_hash);
+    bool is_new = caches_[shard_id]->checkout_slot(hash, slot, evicted_hash);
     (void)evicted_hash;
 
+    // 如果hash已存在（is_new为false），跳过实际的磁盘写入操作
+    // 直接返回block_size表示"写入成功"，实现前缀去重
+    if (!is_new) {
+      return block_size_;
+    }
+
+    // 只有新hash才执行实际的磁盘写入
     std::lock_guard<std::mutex> lock(*locks_[shard_id]);
     size_t offset = slot * block_size_;
     files_[shard_id].seekp(offset, std::ios::beg);
