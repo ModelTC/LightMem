@@ -3,10 +3,10 @@
 #include "config.h"
 
 #include "core/error.h"
-#include "core/queue.h"
-#include "core/task.h"
-#include "service/base.h"
-#include "storage/local.h"
+#include "core/task_queue.h"
+#include "core/cache_task.h"
+#include "service/cache_service.h"
+#include "storage/local_storage_engine.h"
 
 #include <algorithm>
 #include <atomic>

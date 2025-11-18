@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mytorch.cuh"
+#include <torch/torch.h>
 
 #include <array>
 #include <atomic>

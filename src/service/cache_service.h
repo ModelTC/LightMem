@@ -4,9 +4,9 @@
 
 #include "config.h"
 #include "core/error.h"
-#include "core/queue.h"
-#include "core/task.h"
-#include "storage/local.h"
+#include "core/task_queue.h"
+#include "core/cache_task.h"
+#include "storage/local_storage_engine.h"
 
 #include <algorithm>
 #include <atomic>

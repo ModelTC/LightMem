@@ -2,7 +2,7 @@
 
 #include "config.h"
 #include "core/error.h"
-#include "core/task.h"
+#include "core/cache_task.h"
 
 #include <boost/lockfree/queue.hpp>
 
