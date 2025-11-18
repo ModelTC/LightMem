@@ -9,5 +9,5 @@ uv build \
   -C override=cmake.options.CMAKE_BUILD_TYPE=Release
   # -C 'override=cmake.build_args=["--parallel","8"]'
 
-pip uninstall -y kvcache
+pip uninstall -y light-mem
 pip install dist/*.whl

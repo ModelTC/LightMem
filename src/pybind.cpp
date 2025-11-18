@@ -35,11 +35,9 @@ PYBIND11_MODULE(MODULE_NAME, m) {
            py::arg("num_workers"))
       .def("run", &LocalCacheService::run)
       .def("query", &LocalCacheService::query)
-      .def("az5", &LocalCacheService::az5)
+      .def("abort", &LocalCacheService::abort_task)
       .def("create", &LocalCacheService::create)
       .def("active_create_count", &LocalCacheService::active_create_count, py::arg("mode"))
-      .def("get_hash_info", &LocalCacheService::get_hash_info)
-      .def("set_hash_info", &LocalCacheService::set_hash_info)
       .def("block_size", &LocalCacheService::block_size)
       .def("page_size", &LocalCacheService::page_size);
 }

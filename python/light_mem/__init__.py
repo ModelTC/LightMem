@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import xxhash
 
-from . import kvcache
+from . import light_mem
 
 
 class PyState(Enum):
@@ -39,10 +39,10 @@ class PyTask:
     def __init__(self, _c):
         self._c = _c
         self._state_convert = {
-            kvcache.State.Initial: PyState.Initial,
-            kvcache.State.Working: PyState.Working,
-            kvcache.State.Finished: PyState.Finished,
-            kvcache.State.Aborted: PyState.Aborted
+            light_mem.State.Initial: PyState.Initial,
+            light_mem.State.Working: PyState.Working,
+            light_mem.State.Finished: PyState.Finished,
+            light_mem.State.Aborted: PyState.Aborted
         }
 
     def ready(self) -> bool:
@@ -88,7 +88,7 @@ class PyLocalCacheService:
         num_pages_total = kvcache_tensor.shape[0]
         num_layers = kvcache_tensor.shape[1]
 
-        self._c = kvcache.LocalCacheService(
+        self._c = light_mem.LocalCacheService(
             file=file,
             storage_size=storage_size,
             num_of_shard=num_shard,
@@ -157,27 +157,16 @@ class PyLocalCacheService:
         hashs = self.hash(tokens=tokens)
         return self._c.query(hashs)
 
-    def get_hash_info(self):
-        """获取当前存储的哈希索引信息，以便在不同服务之间共享"""
-        return self._c.get_hash_info()
-
-    def set_hash_info(self, hash_info):
-        """设置存储的哈希索引信息，与其他服务共享同一份缓存索引"""
-        self._c.set_hash_info(hash_info)
-
     def active_threads(self, mode: str) -> int:
         """统计当前处于执行中的读写任务数量，mode 使用 "r" 或 "w"""
         return int(self._c.active_create_count(mode))
 
-    def az5(self, t: PyTask):
+    def abort(self, t: PyTask):
         """ 终止一个任务的执行，此函数调用后，
         工作线程不会立即停止工作(因为他们是异步的，可能有正在进行的任务)，
-        但保证所有工作线程不再会从 kvcache 中读写内容
-
-        他为什么叫 AZ5: AZ-5按钮是核反应堆紧急停堆按钮
-        按下此按钮会使所有控制棒插入反应堆，停止反应堆运行。
+        但保证所有工作线程不再会从缓存中读写内容
         """
-        self._c.az5(t._c)
+        self._c.abort(t._c)
 
 __all__ = [
     "PyState", "PyTask", "PyLocalCacheService",

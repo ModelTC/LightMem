@@ -40,12 +40,12 @@ int64_t get_env_int64(const char *name) {
 }
 
 int64_t resolve_max_block_size_bytes() {
-  const int64_t env_override = get_env_int64(ACS_MaxBlockSizeEnvVar);
+  const int64_t env_override = get_env_int64(LM_MaxBlockSizeEnvVar);
   if (env_override > 0) {
     return env_override;
   }
   if (env_override == 0) {
-    return ACS_DefaultMaxBlockSizeBytes;
+    return LM_DefaultMaxBlockSizeBytes;
   }
   return std::numeric_limits<int64_t>::max();
 }
@@ -122,7 +122,7 @@ public:
     const int64_t page_bytes = cache_info_.page_size * cache_info_.num_of_layer;
     const int64_t block_limit = resolve_max_block_size_bytes();
 
-    int64_t pages_per_block = std::max<int64_t>(1, ACS_TokensPerBlock);
+    int64_t pages_per_block = std::max<int64_t>(1, LM_TokensPerBlock);
     if (block_limit > 0 && block_limit < std::numeric_limits<int64_t>::max()) {
       const int64_t max_pages_by_size = std::max<int64_t>(1, block_limit / std::max<int64_t>(page_bytes, int64_t(1)));
       pages_per_block = std::max<int64_t>(1, std::min<int64_t>(pages_per_block, max_pages_by_size));
@@ -220,7 +220,7 @@ public:
     }
 
     // Submit task to the task queue
-    if (queue_->submit(task) != cache::error::ACS_SUCCESS) {
+    if (queue_->submit(task) != cache::error::LM_SUCCESS) {
       {
         std::lock_guard<std::mutex> lock(lock_);
         for (auto it = taskpool_.begin(); it != taskpool_.end(); ++it) {
@@ -237,20 +237,20 @@ public:
   }
 
   /**
-   * The az5 function notifies the system to immediately
+   * The abort_task function notifies the system to immediately
    * abandon the subsequent execution of a task.
    * Since CacheService tasks are executed asynchronously in units of TaskBlocks,
    * some blocks in this task may have completed asynchronous access,
    * some may be running, and some may not have been launched yet.
-   * The abort function will stop the launch of subsequent tasks
+   * The abort_task function will stop the launch of subsequent tasks
    * and immediately terminate the currently running blocks.
    * Blocks that have completed access are not affected.
    * Threads that are currently working may not be able to immediately end the task and respond,
    * and resources can only be reclaimed after the last thread completes execution.
-   * After calling the abort function, the current task will no longer perform
+   * After calling the abort_task function, the current task will no longer perform
    * read/write operations on the kvcache.
    */
-  void az5(const std::shared_ptr<cache::task::CacheTask> &task) {
+  void abort_task(const std::shared_ptr<cache::task::CacheTask> &task) {
     for (cache::task::CacheBlock *block : task->blocks) {
       abort(block);
     }

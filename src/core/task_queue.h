@@ -24,11 +24,11 @@ public:
   TaskQueue(TaskQueue &&other) = delete;
   TaskQueue &operator=(TaskQueue &&other) = delete;
 
-  cache::error::ACSError_t submit(const std::shared_ptr<cache::task::CacheTask> &task) {
+  cache::error::LMError_t submit(const std::shared_ptr<cache::task::CacheTask> &task) {
     for (cache::task::CacheBlock *block : task->blocks) {
       blocks_.push(block);
     }
-    return cache::error::ACS_SUCCESS;
+    return cache::error::LM_SUCCESS;
   }
 
   cache::task::CacheBlock *claim() {
@@ -41,7 +41,7 @@ public:
   }
 
 private:
-  boost::lockfree::queue<cache::task::CacheBlock *> blocks_{ACS_QueueSize}; ///< Lock-free queue for cache blocks.
+  boost::lockfree::queue<cache::task::CacheBlock *> blocks_{LM_QueueSize}; ///< Lock-free queue for cache blocks.
   int32_t max_depth_{};                                                     ///< Maximum queue depth.
 };
 

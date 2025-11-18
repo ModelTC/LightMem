@@ -117,12 +117,6 @@ public:
     }
   }
 
-  std::shared_ptr<cache::storage::LocalStorageEngine::HashInfo> get_hash_info() { return storage_->getHashInfo(); }
-
-  void set_hash_info(const std::shared_ptr<cache::storage::LocalStorageEngine::HashInfo> &info) {
-    storage_->setHashInfo(info);
-  }
-
 protected:
   void on_task_finalized(cache::task::CacheTask *task) override {
     if (task->mode == cache::task::Mode::Write) {

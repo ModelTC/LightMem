@@ -1,6 +1,6 @@
 import os
 import torch
-from cache import PyLocalCacheService, PyTask, PyState
+from light_mem import PyLocalCacheService, PyTask, PyState
 
 FILE_SIZE = 32 * (1024**3) # 32GB
 VOCABS = 180000
@@ -34,7 +34,7 @@ indexer = [_ for _ in range(NUM_PAGES)]
 indexer = torch.tensor(indexer, device="cpu", dtype=torch.int32)
 
 t: PyTask = service.create(tokens=tokens, kv_page_indexer=indexer, mode="w")
-service.az5(t)
+service.abort(t)
 
 if t.ready() != True:
     raise Exception("Unexpected task state.")

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(kvcache LANGUAGES CXX)
+project(light_mem LANGUAGES CXX)
 
 find_package(Threads REQUIRED)
 

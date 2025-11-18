@@ -3,7 +3,7 @@ import time
 import os
 
 import torch
-from cache import PyLocalCacheService, PyTask
+from light_mem import PyLocalCacheService, PyTask
 
 FILE_SIZE = 128 * (1024**3) # 128GB
 VOCABS = 180000
