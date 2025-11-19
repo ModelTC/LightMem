@@ -263,7 +263,7 @@ public:
     std::lock_guard<std::mutex> lock(block->task->lock);
     if (block->state == cache::task::State::Initial || block->state == cache::task::State::Working) {
       block->state = cache::task::State::Aborted;
-      block->task->num_finished_blocks++;
+      block->task->num_finished_blocks.fetch_add(1, std::memory_order_release);
       if (block->task->ready()) {
         finalize_task(block->task);
       }
@@ -277,7 +277,7 @@ public:
 
       if (block->state == cache::task::State::Working) {
         block->state = cache::task::State::Finished;
-        task->num_finished_blocks++;
+        task->num_finished_blocks.fetch_add(1, std::memory_order_release);
       }
     }
 

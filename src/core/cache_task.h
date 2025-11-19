@@ -79,7 +79,7 @@ public:
   CacheTask(CacheTask &&other) = delete;
   CacheTask &operator=(CacheTask &&other) = delete;
 
-  bool ready() const { return num_finished_blocks == blocks.size(); }
+  bool ready() const { return num_finished_blocks.load(std::memory_order_acquire) == blocks.size(); }
 
   /// @brief Check if data is safe to release pages (for write mode)
   /// For write mode: returns true when data has been copied from KV cache
@@ -106,7 +106,7 @@ public:
 
   std::mutex lock;                  ///< Task state lock
   std::vector<CacheBlock *> blocks; ///< Blocks stored as shared_ptr
-  int64_t num_finished_blocks;
+  std::atomic<int64_t> num_finished_blocks; ///< Number of finished blocks (atomic for thread-safe reading)
   std::atomic<int64_t> num_data_ready_blocks; ///< Number of blocks with data copied (for write mode)
   Mode mode; ///< Read/write mode of the task.
   std::atomic<bool> completion_notified;
