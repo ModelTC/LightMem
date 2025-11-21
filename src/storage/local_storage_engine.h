@@ -256,7 +256,7 @@ private:
       std::stringstream ss;
       ss << filename_ << "_" << i;
       std::string shard_filename = ss.str();
-      
+
       // 打开 fstream 用于读写
       files_[i].open(shard_filename, std::ios::binary | std::ios::in | std::ios::out | std::ios::trunc);
       if (!files_[i].is_open()) {
@@ -279,7 +279,7 @@ private:
   size_t shard_;
   size_t block_size_;
   std::vector<std::fstream> files_;
-  std::vector<int> file_fds_;  ///< 原生文件描述符，用于 posix_fadvise
+  std::vector<int> file_fds_; ///< 原生文件描述符，用于 posix_fadvise
   std::vector<std::shared_ptr<std::mutex>> locks_;
   std::vector<std::shared_ptr<LocalCacheIndex>> caches_;
 };

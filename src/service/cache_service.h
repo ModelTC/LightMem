@@ -3,9 +3,9 @@
 #include <torch/extension.h>
 
 #include "config.h"
+#include "core/cache_task.h"
 #include "core/error.h"
 #include "core/task_queue.h"
-#include "core/cache_task.h"
 #include "storage/local_storage_engine.h"
 
 #include <algorithm>
@@ -206,6 +206,24 @@ public:
                                std::to_string(num_of_blocks) + ", got: " + std::to_string(hashs.size()));
     }
     auto task = std::make_shared<cache::task::CacheTask>(hashs, kv_page_indexer, mode);
+
+    // For write mode, query which pages are already in disk cache
+    if (mode == "w") {
+      std::vector<bool> query_result = query(hashs);
+      const int32_t *page_ptr = reinterpret_cast<int32_t *>(kv_page_indexer.data_ptr());
+
+      for (int64_t block_idx = 0; block_idx < static_cast<int64_t>(hashs.size()); ++block_idx) {
+        if (query_result[block_idx]) {
+          // This block is already in disk cache, add its page indices to page_already_list
+          const int64_t start_page_in_block = block_idx * page_per_block;
+          const int64_t end_page_in_block = std::min(start_page_in_block + page_per_block, num_of_pages);
+
+          for (int64_t page_idx = start_page_in_block; page_idx < end_page_in_block; ++page_idx) {
+            task->page_already_list.push_back(page_ptr[page_idx]);
+          }
+        }
+      }
+    }
 
     active_counter->fetch_add(1, std::memory_order_relaxed);
 

@@ -2,9 +2,9 @@
 
 #include "config.h"
 
+#include "core/cache_task.h"
 #include "core/error.h"
 #include "core/task_queue.h"
-#include "core/cache_task.h"
 #include "service/cache_service.h"
 #include "storage/local_storage_engine.h"
 
@@ -218,12 +218,12 @@ protected:
     }
 
     const double delta_read_gb = static_cast<double>(delta_read) / (1024.0 * 1024.0 * 1024.0);
-    
+
     // Reset counters for next batch after queue is empty
     read_last_log_time_ = now;
-    read_last_logged_bytes_ = 0;  // Reset to 0 instead of total_read
-    total_read_bytes_.store(0, std::memory_order_relaxed);  // Clear accumulated bytes
-    first_read_time_ticks_.store(0, std::memory_order_relaxed);  // Reset timing
+    read_last_logged_bytes_ = 0;                                // Reset to 0 instead of total_read
+    total_read_bytes_.store(0, std::memory_order_relaxed);      // Clear accumulated bytes
+    first_read_time_ticks_.store(0, std::memory_order_relaxed); // Reset timing
     printf("[kvcache] batch read size: %.2f GB, read speed: %.2f GB/s\n", delta_read_gb, speed_gbps);
   }
 

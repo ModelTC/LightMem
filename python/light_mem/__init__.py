@@ -60,6 +60,11 @@ class PyTask:
         """ state 函数用来询问所有任务块的执行情况 """
         return [self._state_convert[s] for s in self._c.state()]
 
+    @property
+    def page_already_list(self) -> List[int]:
+        """ 返回已经完成落盘的page索引列表（写模式下，hash查询发现在disk cache里已经有的内容）"""
+        return self._c.get_page_already_list()
+
 
 class PyLocalCacheService:
     """ 基于本地存储的异步数据存取服务 """

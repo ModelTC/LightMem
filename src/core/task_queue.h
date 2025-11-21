@@ -1,8 +1,8 @@
 #pragma once
 
 #include "config.h"
-#include "core/error.h"
 #include "core/cache_task.h"
+#include "core/error.h"
 
 #include <boost/lockfree/queue.hpp>
 
@@ -42,7 +42,7 @@ public:
 
 private:
   boost::lockfree::queue<cache::task::CacheBlock *> blocks_{LM_QueueSize}; ///< Lock-free queue for cache blocks.
-  int32_t max_depth_{};                                                     ///< Maximum queue depth.
+  int32_t max_depth_{};                                                    ///< Maximum queue depth.
 };
 
 } // namespace cache::queue
