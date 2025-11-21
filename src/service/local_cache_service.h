@@ -62,12 +62,18 @@ public:
 
     storage_ = make_unique<LocalStorageEngine>(file, storage_size, num_shard, block_size_);
 
-    r_cpu_buffers_.resize(num_workers_);
-    w_cpu_buffers_.resize(num_workers_);
+    // Use unique_ptr for exception safety - if any allocation fails, previous allocations are automatically cleaned up
+    r_cpu_buffers_.reserve(num_workers_);
+    w_cpu_buffers_.reserve(num_workers_);
 
-    for (size_t i = 0; i < num_workers_; ++i) {
-      r_cpu_buffers_[i] = new char[block_size_];
-      w_cpu_buffers_[i] = new char[block_size_];
+    try {
+      for (size_t i = 0; i < num_workers_; ++i) {
+        r_cpu_buffers_.emplace_back(new char[block_size_]);
+        w_cpu_buffers_.emplace_back(new char[block_size_]);
+      }
+    } catch (...) {
+      // unique_ptr will automatically clean up already allocated buffers
+      throw;
     }
   }
 
@@ -82,13 +88,7 @@ public:
       }
     }
 
-    for (auto &buffer : r_cpu_buffers_) {
-      delete[] buffer;
-    }
-    for (auto &buffer : w_cpu_buffers_) {
-      delete[] buffer;
-    }
-
+    // unique_ptr will automatically delete the buffers
     r_cpu_buffers_.clear();
     w_cpu_buffers_.clear();
   }
@@ -120,7 +120,7 @@ public:
 
 protected:
   void on_task_finalized(cache::task::CacheTask *task) override {
-    if (task->mode == cache::task::Mode::Write) {
+    if (task->operation_mode == cache::task::Mode::Write) {
       // Try to acquire the lock, skip logging if contention occurs
       std::unique_lock<std::mutex> guard(log_mutex_, std::try_to_lock);
       if (!guard.owns_lock()) {
@@ -174,7 +174,7 @@ protected:
       return;
     }
 
-    if (task->mode != cache::task::Mode::Read) {
+    if (task->operation_mode != cache::task::Mode::Read) {
       return;
     }
     if (active_read_creates_.load(std::memory_order_relaxed) != 0) {
@@ -239,7 +239,7 @@ private:
       if (auto block = this->queue_->claim()) {
         if (block != nullptr) {
           CacheTask *task = block->task;
-          char *cpu_buffer = (task->mode == Mode::Read) ? r_cpu_buffers_[index] : w_cpu_buffers_[index];
+          char *cpu_buffer = (task->operation_mode == Mode::Read) ? r_cpu_buffers_[index].get() : w_cpu_buffers_[index].get();
           processTask(block, cpu_buffer);
         }
       }
@@ -266,7 +266,7 @@ private:
     }
 
     bool success = false;
-    if (task->mode == Mode::Read) {
+    if (task->operation_mode == Mode::Read) {
       success = handleReadCpu(block, cpu_buffer, page_ptr, num_of_page);
     } else {
       success = handleWriteCpu(block, cpu_buffer, page_ptr, num_of_page);
@@ -291,7 +291,7 @@ private:
     }
 
     {
-      std::lock_guard<std::mutex> lock(block->task->lock);
+      std::lock_guard<std::mutex> lock(block->task->state_mutex);
       if (block->state != cache::task::State::Working) {
         return false;
       }
@@ -311,7 +311,7 @@ private:
 
   bool handleWriteCpu(CacheBlock *block, char *cpu_buffer, int32_t *page_ptr, int64_t num_of_page) {
     {
-      std::lock_guard<std::mutex> lock(block->task->lock);
+      std::lock_guard<std::mutex> lock(block->task->state_mutex);
       if (block->state != cache::task::State::Working) {
         return false;
       }
@@ -395,8 +395,8 @@ private:
   vector<thread> workers_;                              ///< Worker threads
   bool stop_;                                           ///< Thread stop flag
   size_t num_workers_;                                  ///< Number of worker threads
-  vector<char *> r_cpu_buffers_;                        ///< CPU buffers for read worker
-  vector<char *> w_cpu_buffers_;                        ///< CPU buffers for write worker
+  vector<unique_ptr<char[]>> r_cpu_buffers_;            ///< CPU buffers for read worker (RAII managed)
+  vector<unique_ptr<char[]>> w_cpu_buffers_;            ///< CPU buffers for write worker (RAII managed)
   std::atomic<uint64_t> total_written_bytes_;           ///< Total bytes written to disk
   std::atomic<int64_t> first_write_time_ticks_;         ///< First write start time in steady clock ticks
   std::atomic<int64_t> last_write_time_ticks_;          ///< Last write completion time in steady clock ticks

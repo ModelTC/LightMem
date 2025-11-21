@@ -25,8 +25,8 @@ public:
   TaskQueue &operator=(TaskQueue &&other) = delete;
 
   cache::error::LMError_t submit(const std::shared_ptr<cache::task::CacheTask> &task) {
-    for (cache::task::CacheBlock *block : task->blocks) {
-      blocks_.push(block);
+    for (const auto &block : task->blocks) {
+      blocks_.push(block.get());
     }
     return cache::error::LM_SUCCESS;
   }

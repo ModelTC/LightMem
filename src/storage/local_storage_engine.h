@@ -164,23 +164,21 @@ public:
     files_.resize(shard_);
     file_fds_.resize(shard_, -1);
 
-    for (size_t i = 0; i < shard_; i++) {
-      caches_[i] = std::make_shared<LocalCacheIndex>(shard_capacity);
-      locks_[i] = std::make_shared<std::mutex>();
+    try {
+      for (size_t i = 0; i < shard_; i++) {
+        caches_[i] = std::make_shared<LocalCacheIndex>(shard_capacity);
+        locks_[i] = std::make_shared<std::mutex>();
+      }
+      createOrOpenFiles(shard_storage_size);
+    } catch (...) {
+      // Clean up any partially opened files on exception
+      cleanup();
+      throw;
     }
-    createOrOpenFiles(shard_storage_size);
   }
 
   ~LocalStorageEngine() override {
-    for (size_t i = 0; i < shard_; i++) {
-      if (files_[i].is_open()) {
-        files_[i].close();
-      }
-      if (file_fds_[i] >= 0) {
-        close(file_fds_[i]);
-        file_fds_[i] = -1;
-      }
-    }
+    cleanup();
   }
 
   bool query(const std::string &hash) override {
@@ -250,6 +248,23 @@ public:
 
 private:
   inline size_t getShard(const std::string &hash) { return std::hash<std::string>{}(hash) % shard_; }
+
+  // Helper function to clean up file resources
+  void cleanup() {
+    for (size_t i = 0; i < shard_; i++) {
+      if (files_[i].is_open()) {
+        try {
+          files_[i].close();
+        } catch (...) {
+          // Ignore exceptions during cleanup
+        }
+      }
+      if (file_fds_[i] >= 0) {
+        close(file_fds_[i]);
+        file_fds_[i] = -1;
+      }
+    }
+  }
 
   void createOrOpenFiles(size_t shard_storage_size) {
     for (size_t i = 0; i < shard_; i++) {

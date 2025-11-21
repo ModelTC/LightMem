@@ -269,8 +269,8 @@ public:
    * read/write operations on the kvcache.
    */
   void abort_task(const std::shared_ptr<cache::task::CacheTask> &task) {
-    for (cache::task::CacheBlock *block : task->blocks) {
-      abort(block);
+    for (const auto &block : task->blocks) {
+      abort(block.get());
     }
   }
 
@@ -278,7 +278,7 @@ public:
    * Notify the system to immediately abandon the subsequent execution of a Block.
    */
   void abort(cache::task::CacheBlock *block) {
-    std::lock_guard<std::mutex> lock(block->task->lock);
+    std::lock_guard<std::mutex> lock(block->task->state_mutex);
     if (block->state == cache::task::State::Initial || block->state == cache::task::State::Working) {
       block->state = cache::task::State::Aborted;
       block->task->num_finished_blocks.fetch_add(1, std::memory_order_release);
@@ -291,7 +291,7 @@ public:
   void deliver(cache::task::CacheBlock *block) {
     auto task = block->task;
     {
-      std::lock_guard<std::mutex> lock(task->lock);
+      std::lock_guard<std::mutex> lock(task->state_mutex);
 
       if (block->state == cache::task::State::Working) {
         block->state = cache::task::State::Finished;
@@ -343,6 +343,11 @@ inline void CacheService::finalize_task(cache::task::CacheTask *task) {
     std::lock_guard<std::mutex> lock(lock_);
     for (auto it = taskpool_.begin(); it != taskpool_.end(); ++it) {
       if (it->get() == task) {
+        // IMPORTANT: After this erase, the shared_ptr may be destroyed if Python side has released it.
+        // This is safe because:
+        // 1. All blocks have finished (checked by task->ready())
+        // 2. No worker threads should be accessing this task anymore
+        // 3. The task pointer 'task' is only used for comparison and counter update
         taskpool_.erase(it);
         break;
       }
@@ -350,8 +355,11 @@ inline void CacheService::finalize_task(cache::task::CacheTask *task) {
   }
 
   std::atomic<int64_t> *active_counter =
-      (task->mode == cache::task::Mode::Read) ? &active_read_creates_ : &active_write_creates_;
+      (task->operation_mode == cache::task::Mode::Read) ? &active_read_creates_ : &active_write_creates_;
   active_counter->fetch_sub(1, std::memory_order_relaxed);
+  
+  // Note: 'task' pointer may become invalid after this point if no other references exist
+  // on_task_finalized should not dereference 'task' beyond this point unless it maintains its own reference
   on_task_finalized(task);
 }
 
