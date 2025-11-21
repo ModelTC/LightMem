@@ -116,18 +116,17 @@ class PyLocalCacheService:
         :param tokens: 整数列表，表示需要哈希的 token 序列。
         :return: 每个分块的哈希值列表。
         """
-        ret: List[str] = []
-
+        if not tokens:
+            return []
         tokens_np = np.array(tokens, dtype=np.uint64)
-
-        for i in range(0, len(tokens_np), self._n):
-            chunk = tokens_np[i : i + self._n]
-            if chunk.size == 0:
-                break
-            digest = xxhash.xxh3_128(chunk.tobytes()).hexdigest()
-            ret.append(digest)
-
-        return ret
+        num_full = len(tokens_np) // self._n
+        # 处理完整块
+        result = [xxhash.xxh3_128(chunk.tobytes()).hexdigest()
+                  for chunk in tokens_np[:num_full * self._n].reshape(num_full, self._n)] if num_full > 0 else []
+        # 处理剩余块
+        if len(tokens_np) % self._n:
+            result.append(xxhash.xxh3_128(tokens_np[num_full * self._n:].tobytes()).hexdigest())
+        return result
 
     def create(
         self, tokens: List[int], kv_page_indexer: torch.Tensor, mode: str, start_pos: int = 0

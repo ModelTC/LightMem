@@ -66,5 +66,18 @@ for num_of_page in (1, 4, 16, 64, 256, 1024, 4096, 16384, 65536):
         f"Bandwidth: {bandwidth:.2f} GB/Sec"
     )
 
+# 恢复原始数据并写入所有pages
+kvcache.copy_(kvcache_backup)
+all_indexer = torch.arange(NUM_PAGES, device="cpu", dtype=torch.int32)
+t = service.create(tokens=list(range(NUM_PAGES)), kv_page_indexer=all_indexer, mode="w")
+while not t.ready():
+    pass
+
+# 清空并读取所有pages
+kvcache.zero_()
+t = service.create(tokens=list(range(NUM_PAGES)), kv_page_indexer=all_indexer, mode="r")
+while not t.ready():
+    pass
+
 # 验证读取的数据与原始数据一致
 assert torch.allclose(kvcache, kvcache_backup)

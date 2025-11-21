@@ -19,9 +19,8 @@ enum State { Initial = 0, Working = 1, Finished = 2, Aborted = 3 };
 
 enum Mode { Write = 1, Read = 2 };
 
-class CacheTask; // 预声明 CacheTask 以便在 CacheBlock 中使用
+class CacheTask;
 
-/// @brief Cache block class, storing SHA-256 hash and GPU memory buffer pointer.
 class CacheBlock {
 public:
   /// @brief Constructor, calculates the SHA-256 hash of the data.

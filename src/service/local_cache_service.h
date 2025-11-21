@@ -49,8 +49,9 @@ public:
   LocalCacheService(const string &file, size_t storage_size, size_t num_shard, const torch::Tensor &kvcache,
                     const size_t num_workers)
       : CacheService(kvcache), stop_(false), num_workers_(num_workers), block_size_(0), total_written_bytes_(0),
-        first_write_time_ticks_(0), last_log_time_(), last_logged_bytes_(0), total_read_bytes_(0),
-        first_read_time_ticks_(0), read_last_log_time_(), read_last_logged_bytes_(0) {
+        first_write_time_ticks_(0), last_write_time_ticks_(0), last_log_time_(), last_logged_bytes_(0),
+        total_read_bytes_(0), first_read_time_ticks_(0), last_read_time_ticks_(0), read_last_log_time_(),
+        read_last_logged_bytes_(0) {
     block_size_ = static_cast<size_t>(this->block_size());
 
     if (storage_size < block_size_) {
@@ -142,6 +143,8 @@ protected:
       const uint64_t previous_bytes = last_logged_bytes_;
       const uint64_t delta_bytes = (total >= previous_bytes) ? (total - previous_bytes) : 0;
       double speed_gbps = 0.0;
+
+      // Use actual I/O time for speed calculation
       if (last_log_time_ != std::chrono::steady_clock::time_point{}) {
         const double elapsed_sec =
             std::chrono::duration_cast<std::chrono::duration<double>>(now - last_log_time_).count();
@@ -149,6 +152,7 @@ protected:
           speed_gbps = (static_cast<double>(delta_bytes) / (1024.0 * 1024.0 * 1024.0)) / elapsed_sec;
         }
       } else {
+        // For the first log, use time from first write start to now
         const int64_t first_ticks = first_write_time_ticks_.load(std::memory_order_relaxed);
         if (first_ticks != 0) {
           const auto first_duration =
@@ -184,8 +188,6 @@ protected:
       return;
     }
 
-    const auto now = std::chrono::steady_clock::now();
-
     // Calculate batch read amount (since last queue empty)
     const uint64_t previous_read = read_last_logged_bytes_;
     const uint64_t delta_read = (total_read >= previous_read) ? (total_read - previous_read) : 0;
@@ -193,23 +195,22 @@ protected:
       return;
     }
 
+    // Use actual I/O time: from first read start to last read completion
+    const int64_t first_ticks = first_read_time_ticks_.load(std::memory_order_relaxed);
+    const int64_t last_ticks = last_read_time_ticks_.load(std::memory_order_relaxed);
+
     double speed_gbps = 0.0;
-    if (read_last_log_time_ != std::chrono::steady_clock::time_point{}) {
+    if (first_ticks != 0 && last_ticks != 0 && last_ticks > first_ticks) {
+      const auto first_duration =
+          std::chrono::steady_clock::duration(static_cast<std::chrono::steady_clock::duration::rep>(first_ticks));
+      const auto last_duration =
+          std::chrono::steady_clock::duration(static_cast<std::chrono::steady_clock::duration::rep>(last_ticks));
+      const auto first_time = std::chrono::steady_clock::time_point(first_duration);
+      const auto last_time = std::chrono::steady_clock::time_point(last_duration);
       const double elapsed_sec =
-          std::chrono::duration_cast<std::chrono::duration<double>>(now - read_last_log_time_).count();
+          std::chrono::duration_cast<std::chrono::duration<double>>(last_time - first_time).count();
       if (elapsed_sec > 0.0) {
         speed_gbps = (static_cast<double>(delta_read) / (1024.0 * 1024.0 * 1024.0)) / elapsed_sec;
-      }
-    } else {
-      const int64_t first_ticks = first_read_time_ticks_.load(std::memory_order_relaxed);
-      if (first_ticks != 0) {
-        const auto first_duration =
-            std::chrono::steady_clock::duration(static_cast<std::chrono::steady_clock::duration::rep>(first_ticks));
-        const auto first_time = std::chrono::steady_clock::time_point(first_duration);
-        const double elapsed_sec = std::chrono::duration_cast<std::chrono::duration<double>>(now - first_time).count();
-        if (elapsed_sec > 0.0) {
-          speed_gbps = (static_cast<double>(delta_read) / (1024.0 * 1024.0 * 1024.0)) / elapsed_sec;
-        }
       }
     }
 
@@ -220,10 +221,11 @@ protected:
     const double delta_read_gb = static_cast<double>(delta_read) / (1024.0 * 1024.0 * 1024.0);
 
     // Reset counters for next batch after queue is empty
-    read_last_log_time_ = now;
+    read_last_log_time_ = std::chrono::steady_clock::now();
     read_last_logged_bytes_ = 0;                                // Reset to 0 instead of total_read
     total_read_bytes_.store(0, std::memory_order_relaxed);      // Clear accumulated bytes
     first_read_time_ticks_.store(0, std::memory_order_relaxed); // Reset timing
+    last_read_time_ticks_.store(0, std::memory_order_relaxed);  // Reset timing
     printf("[kvcache] batch read size: %.2f GB, read speed: %.2f GB/s\n", delta_read_gb, speed_gbps);
   }
 
@@ -274,6 +276,15 @@ private:
   }
 
   bool handleReadCpu(CacheBlock *block, char *cpu_buffer, int32_t *page_ptr, int64_t num_of_page) {
+    // Record start time before the first read operation begins
+    if (first_read_time_ticks_.load(std::memory_order_relaxed) == 0) {
+      const auto now_duration = std::chrono::steady_clock::now().time_since_epoch();
+      const int64_t now_ticks = static_cast<int64_t>(now_duration.count());
+      int64_t expected = 0;
+      first_read_time_ticks_.compare_exchange_strong(expected, now_ticks, std::memory_order_relaxed,
+                                                     std::memory_order_relaxed);
+    }
+
     const size_t read_bytes = storage_->read(cpu_buffer, block->hash);
     if (read_bytes != block_size_) {
       return false;
@@ -287,15 +298,14 @@ private:
     }
 
     total_read_bytes_.fetch_add(static_cast<uint64_t>(read_bytes), std::memory_order_relaxed);
-    if (first_read_time_ticks_.load(std::memory_order_relaxed) == 0) {
-      const auto now_duration = std::chrono::steady_clock::now().time_since_epoch();
-      const int64_t now_ticks = static_cast<int64_t>(now_duration.count());
-      int64_t expected = 0;
-      first_read_time_ticks_.compare_exchange_strong(expected, now_ticks, std::memory_order_relaxed,
-                                                     std::memory_order_relaxed);
-    }
 
     cpu_scatter(this->cache_info_, cpu_buffer, page_ptr, num_of_page);
+
+    // Record end time after scatter completes
+    const auto now_duration = std::chrono::steady_clock::now().time_since_epoch();
+    const int64_t now_ticks = static_cast<int64_t>(now_duration.count());
+    last_read_time_ticks_.store(now_ticks, std::memory_order_relaxed);
+
     return true;
   }
 
@@ -305,6 +315,15 @@ private:
       if (block->state != cache::task::State::Working) {
         return false;
       }
+    }
+
+    // Record start time before the first write operation begins
+    if (first_write_time_ticks_.load(std::memory_order_relaxed) == 0) {
+      const auto now_duration = std::chrono::steady_clock::now().time_since_epoch();
+      const int64_t now_ticks = static_cast<int64_t>(now_duration.count());
+      int64_t expected = 0;
+      first_write_time_ticks_.compare_exchange_strong(expected, now_ticks, std::memory_order_relaxed,
+                                                      std::memory_order_relaxed);
     }
 
     // Step 1: Gather data from KV cache to temporary buffer
@@ -321,14 +340,13 @@ private:
     }
     if (written == block_size_) {
       total_written_bytes_.fetch_add(static_cast<uint64_t>(written), std::memory_order_relaxed);
-      if (first_write_time_ticks_.load(std::memory_order_relaxed) == 0) {
-        const auto now_duration = std::chrono::steady_clock::now().time_since_epoch();
-        const int64_t now_ticks = static_cast<int64_t>(now_duration.count());
-        int64_t expected = 0;
-        first_write_time_ticks_.compare_exchange_strong(expected, now_ticks, std::memory_order_relaxed,
-                                                        std::memory_order_relaxed);
-      }
     }
+
+    // Record end time after write completes
+    const auto now_duration = std::chrono::steady_clock::now().time_since_epoch();
+    const int64_t now_ticks = static_cast<int64_t>(now_duration.count());
+    last_write_time_ticks_.store(now_ticks, std::memory_order_relaxed);
+
     return true;
   }
 
@@ -380,13 +398,15 @@ private:
   vector<char *> r_cpu_buffers_;                        ///< CPU buffers for read worker
   vector<char *> w_cpu_buffers_;                        ///< CPU buffers for write worker
   std::atomic<uint64_t> total_written_bytes_;           ///< Total bytes written to disk
-  std::atomic<int64_t> first_write_time_ticks_;         ///< First write time in steady clock ticks
+  std::atomic<int64_t> first_write_time_ticks_;         ///< First write start time in steady clock ticks
+  std::atomic<int64_t> last_write_time_ticks_;          ///< Last write completion time in steady clock ticks
   std::mutex log_mutex_;                                ///< Protects write rate reporting
   std::chrono::steady_clock::time_point last_log_time_; ///< Last write log timestamp
   uint64_t last_logged_bytes_;                          ///< Bytes recorded at last write log
 
   std::atomic<uint64_t> total_read_bytes_;                   ///< Total bytes read from disk
-  std::atomic<int64_t> first_read_time_ticks_;               ///< First read completion time in steady clock ticks
+  std::atomic<int64_t> first_read_time_ticks_;               ///< First read start time in steady clock ticks
+  std::atomic<int64_t> last_read_time_ticks_;                ///< Last read completion time in steady clock ticks
   std::mutex read_log_mutex_;                                ///< Protects read rate reporting
   std::chrono::steady_clock::time_point read_last_log_time_; ///< Last read log timestamp
   uint64_t read_last_logged_bytes_;                          ///< Bytes recorded at last read log
