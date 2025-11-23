@@ -204,9 +204,12 @@ public:
     files_[shard_id].flush();
 
     // 立即丢弃新写入的页缓存，避免污染读缓存
+    // Note: posix_fadvise is not available on macOS
+#ifndef __APPLE__
     if (file_fds_[shard_id] >= 0) {
       posix_fadvise(file_fds_[shard_id], offset, block_size_, POSIX_FADV_DONTNEED);
     }
+#endif
 
     return block_size_;
   }

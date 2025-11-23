@@ -3,15 +3,17 @@ set(name ${PROJECT_NAME})
 # dependencies
 find_package(Python 3 REQUIRED COMPONENTS Development Interpreter)
 
-# Derive Torch CMake path from Python environment root.
-get_filename_component(_python_bin_dir "${Python_EXECUTABLE}" DIRECTORY)
-get_filename_component(_python_env_root "${_python_bin_dir}" DIRECTORY)
-if(Python_VERSION_MAJOR AND Python_VERSION_MINOR)
-  set(_torch_cmake_path "${_python_env_root}/lib/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}/site-packages/torch/share/cmake")
-else()
-  set(_torch_cmake_path "${_python_env_root}/lib/python/site-packages/torch/share/cmake")
-endif()
+# Get site-packages directory from Python
+execute_process(
+  COMMAND "${Python_EXECUTABLE}" -c "import site; print(site.getsitepackages()[0])"
+  OUTPUT_VARIABLE Python_SITELIB
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
+# Derive Torch CMake path from site-packages
+set(_torch_cmake_path "${Python_SITELIB}/torch/share/cmake")
 list(APPEND CMAKE_PREFIX_PATH "${_torch_cmake_path}")
+message(STATUS "CMAKE_PREFIX_PATH: ${CMAKE_PREFIX_PATH}")
 
 find_package(Boost REQUIRED)
 find_package(Torch REQUIRED)
