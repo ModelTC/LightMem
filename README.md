@@ -58,6 +58,11 @@ sudo apt-get install cmake build-essential libboost-all-dev
 brew install cmake boost
 ```
 
+**Using Conda (Cross-platform):**
+```bash
+conda install -c conda-forge cmake cxx-compiler boost libboost-devel
+```
+
 **Install PyTorch:**
 ```bash
 pip install torch
