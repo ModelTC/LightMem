@@ -1,52 +1,54 @@
+#!/usr/bin/env python3
+"""写入性能测试"""
+
+import os
 import random
 import time
-import os
-
 import torch
-from light_mem import PyLocalCacheService, PyTask
+from light_mem import PyLocalCacheService
 
-FILE_SIZE = 128 * (1024**3) # 128GB
+FILE_SIZE = 128 * (1024**3)
 VOCABS = 180000
-
 PAGE_SIZE = 16384
 NUM_PAGES = 128
 NUM_LAYERS = 60
-TOKENS_PER_BLOCK = 64
-BLOCK_SIZE = PAGE_SIZE * NUM_LAYERS * TOKENS_PER_BLOCK
+DTYPE = torch.half
 
-element_bytes = torch.tensor([], dtype=torch.half).element_size()
-if PAGE_SIZE % element_bytes != 0:
-    raise ValueError(
-        f"PAGE_SIZE={PAGE_SIZE} 必须是 dtype torch.half 单元素字节数 {element_bytes} 的整数倍"
-    )
+ELEMENT_BYTES = torch.tensor([], dtype=DTYPE).element_size()
+if PAGE_SIZE % ELEMENT_BYTES != 0:
+    raise ValueError(f"PAGE_SIZE={PAGE_SIZE} 必须是 {DTYPE} 字节数 {ELEMENT_BYTES} 的整数倍")
 
-page_elements = PAGE_SIZE // element_bytes
-kvcache = torch.rand(size=[NUM_PAGES, NUM_LAYERS, page_elements], dtype=torch.half, device="cpu")
+page_elements = PAGE_SIZE // ELEMENT_BYTES
+kvcache = torch.rand(size=[NUM_PAGES, NUM_LAYERS, page_elements], dtype=DTYPE, device="cpu")
 
-# ensure storage directory exists for LocalStorageEngine shards
 os.makedirs("cache", exist_ok=True)
-
 service = PyLocalCacheService(
     kvcache_tensor=kvcache,
-    file="cache/cache_file",
+    file="cache/write_perf",
     storage_size=FILE_SIZE,
     num_shard=32,
     num_worker=32,
 )
 
+print("=" * 60)
+print("写入性能测试")
+print("=" * 60)
+print(f"{'Pages':<12} {'Size(GB)':<12} {'Time(ms)':<12} {'BW(GB/s)':<12}")
+print("-" * 60)
+
 for num_of_page in (1, 4, 16, 64, 256, 1024, 4096, 16384, 65536):
-    tokens  = [random.randint(0, VOCABS) for _ in range(num_of_page)]
-    indexer = [random.randint(0, NUM_PAGES - 1) for _ in range(num_of_page)]
-    indexer = torch.tensor(indexer, device="cpu", dtype=torch.int32)
+    tokens = [random.randint(0, VOCABS) for _ in range(num_of_page)]
+    indexer = torch.tensor([random.randint(0, NUM_PAGES - 1) for _ in range(num_of_page)], dtype=torch.int32)
+    
     start = time.time()
-    t: PyTask = service.create(tokens=tokens, kv_page_indexer=indexer, mode="w")
-
-    # wait until t.ready()
-    while not t.ready(): pass
-
+    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="w")
+    while not task.ready():
+        pass
     end = time.time()
-    size = num_of_page * PAGE_SIZE * NUM_LAYERS / (1e9)
+    
+    size = num_of_page * PAGE_SIZE * NUM_LAYERS / 1e9
     bandwidth = size / (end - start)
+    print(f"{num_of_page:<12} {size:<12.4f} {(end-start)*1000:<12.2f} {bandwidth:<12.2f}")
 
-    print(f"Size: {size:.4f} GB, Time Cost: {(end - start) * 1000:.2f} ms, Bandwidth: {bandwidth:.2f} GB/Sec ")
+print("=" * 60)
 
