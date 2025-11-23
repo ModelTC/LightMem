@@ -44,10 +44,7 @@ int64_t resolve_max_block_size_bytes() {
   if (env_override > 0) {
     return env_override;
   }
-  if (env_override == 0) {
-    return LM_DefaultMaxBlockSizeBytes;
-  }
-  return std::numeric_limits<int64_t>::max();
+  return LM_DefaultMaxBlockSizeBytes;
 }
 
 } // namespace
@@ -63,6 +60,7 @@ struct alignas(8) CacheParam_t {
   int64_t num_of_page;
 
   CacheParam_t() : base_ptr(nullptr), page_size(0), num_of_layer(0), layer_stride(0), page_stride(0), num_of_page(0) {}
+
   CacheParam_t(char *ptr, int64_t page, int64_t layer, int64_t layer_strd, int64_t page_strd, int64_t pages)
       : base_ptr(ptr), page_size(page), num_of_layer(layer), layer_stride(layer_strd), page_stride(page_strd),
         num_of_page(pages) {}
@@ -71,9 +69,6 @@ struct alignas(8) CacheParam_t {
 // Generic Cache Service Base Class
 class CacheService {
 public:
-  // Delete the default constructor
-  CacheService() = delete;
-
   /**
    * Constructor
    * @param kvcache Reference to the CPU kv-cache tensor backing this service
@@ -207,6 +202,9 @@ public:
     }
     auto task = std::make_shared<cache::task::CacheTask>(hashs, kv_page_indexer, mode);
 
+    // Initialize blocks after task is created (needed for weak_ptr in blocks)
+    task->initialize_blocks(hashs);
+
     // For write mode, query which pages are already in disk cache
     if (mode == "w") {
       std::vector<bool> query_result = query(hashs);
@@ -229,11 +227,6 @@ public:
 
     {
       std::lock_guard<std::mutex> lock(lock_);
-      // Push the task into taskpool to retain the reference to the task object on the C++ side.
-      // This ensures that even if the task is released on the Python side,
-      // the task object on the C++ side will not be immediately released.
-      // All task releases should be performed after the task is released on the Python side
-      // and the task is completed (or terminated) on the C++ side.
       taskpool_.push_back(task);
     }
 
@@ -278,18 +271,36 @@ public:
    * Notify the system to immediately abandon the subsequent execution of a Block.
    */
   void abort(cache::task::CacheBlock *block) {
-    std::lock_guard<std::mutex> lock(block->task->state_mutex);
+    auto task = block->get_task();
+    if (!task) {
+      return; // Task has been destroyed, nothing to do
+    }
+
+    std::lock_guard<std::mutex> lock(task->state_mutex);
     if (block->state == cache::task::State::Initial || block->state == cache::task::State::Working) {
       block->state = cache::task::State::Aborted;
-      block->task->num_finished_blocks.fetch_add(1, std::memory_order_release);
-      if (block->task->ready()) {
-        finalize_task(block->task);
+      task->num_finished_blocks.fetch_add(1, std::memory_order_release);
+      if (task->ready()) {
+        finalize_task(task);
       }
     }
   }
 
+  /**
+   * Mark a CacheBlock as completed and update its state.
+   * This function is called by worker threads when they finish processing a block.
+   * It atomically updates the block state to Finished and increments the task's
+   * finished block counter. If all blocks of the task are completed, it triggers
+   * task finalization to release resources.
+   *
+   * @param block Pointer to the CacheBlock that has completed execution
+   */
   void deliver(cache::task::CacheBlock *block) {
-    auto task = block->task;
+    auto task = block->get_task();
+    if (!task) {
+      return; // Task has been destroyed, nothing to do
+    }
+
     {
       std::lock_guard<std::mutex> lock(task->state_mutex);
 
@@ -306,8 +317,8 @@ public:
   }
 
 protected:
-  void finalize_task(cache::task::CacheTask *task);
-  virtual void on_task_finalized(cache::task::CacheTask *task);
+  void finalize_task(const std::shared_ptr<cache::task::CacheTask> &task);
+  virtual void on_task_finalized(const std::shared_ptr<cache::task::CacheTask> &task);
 
   std::mutex lock_;
   std::vector<std::shared_ptr<cache::task::CacheTask>> taskpool_;
@@ -334,35 +345,27 @@ inline int64_t CacheService::active_create_count(const std::string &mode) const 
   throw std::runtime_error("Invalid mode string. Use 'r' for Read or 'w' for Write.");
 }
 
-inline void CacheService::finalize_task(cache::task::CacheTask *task) {
+inline void CacheService::finalize_task(const std::shared_ptr<cache::task::CacheTask> &task) {
   if (!task->mark_completion_notified()) {
     return;
-  }
-
-  {
-    std::lock_guard<std::mutex> lock(lock_);
-    for (auto it = taskpool_.begin(); it != taskpool_.end(); ++it) {
-      if (it->get() == task) {
-        // IMPORTANT: After this erase, the shared_ptr may be destroyed if Python side has released it.
-        // This is safe because:
-        // 1. All blocks have finished (checked by task->ready())
-        // 2. No worker threads should be accessing this task anymore
-        // 3. The task pointer 'task' is only used for comparison and counter update
-        taskpool_.erase(it);
-        break;
-      }
-    }
   }
 
   std::atomic<int64_t> *active_counter =
       (task->operation_mode == cache::task::Mode::Read) ? &active_read_creates_ : &active_write_creates_;
   active_counter->fetch_sub(1, std::memory_order_relaxed);
-  
-  // Note: 'task' pointer may become invalid after this point if no other references exist
-  // on_task_finalized should not dereference 'task' beyond this point unless it maintains its own reference
   on_task_finalized(task);
+
+  {
+    std::lock_guard<std::mutex> lock(lock_);
+    for (auto it = taskpool_.begin(); it != taskpool_.end(); ++it) {
+      if (it->get() == task.get()) {
+        taskpool_.erase(it);
+        break;
+      }
+    }
+  }
 }
 
 } // namespace cache::service
 
-inline void cache::service::CacheService::on_task_finalized(cache::task::CacheTask *task) {}
+inline void cache::service::CacheService::on_task_finalized(const std::shared_ptr<cache::task::CacheTask> &task) {}

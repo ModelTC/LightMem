@@ -119,7 +119,7 @@ public:
   }
 
 protected:
-  void on_task_finalized(cache::task::CacheTask *task) override {
+  void on_task_finalized(const std::shared_ptr<cache::task::CacheTask> &task) override {
     if (task->operation_mode == cache::task::Mode::Write) {
       // Try to acquire the lock, skip logging if contention occurs
       std::unique_lock<std::mutex> guard(log_mutex_, std::try_to_lock);
@@ -238,8 +238,12 @@ private:
     while (!stop_) {
       if (auto block = this->queue_->claim()) {
         if (block != nullptr) {
-          CacheTask *task = block->task;
-          char *cpu_buffer = (task->operation_mode == Mode::Read) ? r_cpu_buffers_[index].get() : w_cpu_buffers_[index].get();
+          auto task = block->get_task();
+          if (!task) {
+            continue; // Task has been destroyed
+          }
+          char *cpu_buffer =
+              (task->operation_mode == Mode::Read) ? r_cpu_buffers_[index].get() : w_cpu_buffers_[index].get();
           processTask(block, cpu_buffer);
         }
       }
@@ -247,7 +251,10 @@ private:
   }
 
   void processTask(CacheBlock *block, char *cpu_buffer) {
-    CacheTask *task = block->task;
+    auto task = block->get_task();
+    if (!task) {
+      return; // Task has been destroyed
+    }
     torch::Tensor page_tensor = task->page_indexer;
     auto bid = block->block_idx;
 
@@ -291,7 +298,11 @@ private:
     }
 
     {
-      std::lock_guard<std::mutex> lock(block->task->state_mutex);
+      auto task = block->get_task();
+      if (!task) {
+        return false;
+      }
+      std::lock_guard<std::mutex> lock(task->state_mutex);
       if (block->state != cache::task::State::Working) {
         return false;
       }
@@ -310,8 +321,13 @@ private:
   }
 
   bool handleWriteCpu(CacheBlock *block, char *cpu_buffer, int32_t *page_ptr, int64_t num_of_page) {
+    auto task = block->get_task();
+    if (!task) {
+      return false; // Task has been destroyed
+    }
+
     {
-      std::lock_guard<std::mutex> lock(block->task->state_mutex);
+      std::lock_guard<std::mutex> lock(task->state_mutex);
       if (block->state != cache::task::State::Working) {
         return false;
       }
@@ -331,7 +347,7 @@ private:
 
     // Critical optimization: Mark data as ready immediately after gather completes
     // This allows Python layer to release pages without waiting for disk I/O
-    block->task->num_data_ready_blocks.fetch_add(1, std::memory_order_release);
+    task->num_data_ready_blocks.fetch_add(1, std::memory_order_release);
 
     // Step 2: Write to disk (this happens asynchronously and doesn't block page release)
     const size_t written = storage_->write(cpu_buffer, block->hash);

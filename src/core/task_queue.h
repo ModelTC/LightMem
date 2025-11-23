@@ -21,8 +21,8 @@ namespace cache::queue {
 class TaskQueue {
 public:
   TaskQueue() = default;
-  TaskQueue(TaskQueue &&other) = delete;
-  TaskQueue &operator=(TaskQueue &&other) = delete;
+  TaskQueue(const TaskQueue &) = delete;
+  TaskQueue &operator=(const TaskQueue &) = delete;
 
   cache::error::LMError_t submit(const std::shared_ptr<cache::task::CacheTask> &task) {
     for (const auto &block : task->blocks) {
@@ -41,8 +41,7 @@ public:
   }
 
 private:
-  boost::lockfree::queue<cache::task::CacheBlock *> blocks_{LM_QueueSize}; ///< Lock-free queue for cache blocks.
-  int32_t max_depth_{};                                                    ///< Maximum queue depth.
+  boost::lockfree::queue<cache::task::CacheBlock *> blocks_{LM_QueueSize};
 };
 
 } // namespace cache::queue
