@@ -77,16 +77,21 @@ python -m build --wheel
 pip install dist/*.whl
 ```
 
-#### Development installation
-```bash
-# Install in editable mode
-pip install -e .
-```bash
-python -m build --wheel
-```
-
 ### Environment Variables
-- `LIGHTMEM_MAX_BLOCK_SIZE`: Override the default maximum block size (in bytes)
+
+#### `LIGHTMEM_MAX_BLOCK_SIZE_MB`
+Controls the maximum size of each cache block in megabytes (MB).
+
+- **Default**: `64` (64MB)
+- **Purpose**: Determines the granularity of cache I/O operations. Each cache block is read from or written to disk as a single unit.
+- **Usage**:
+  ```bash
+  export LIGHTMEM_MAX_BLOCK_SIZE_MB=32  # Set to 32MB
+  ```
+- **Considerations**:
+  - **Larger blocks** (e.g., 128): Reduce overhead, better for sequential access, but may increase latency for small operations
+  - **Smaller blocks** (e.g., 16): More fine-grained control, better for random access, but higher overhead per operation
+  - Must be set before starting the cache service
 
 ## Quick Start
 
@@ -166,8 +171,8 @@ if task.data_safe():
 The block size determines the granularity of cache operations:
 ```bash
 # Default: 64MB per block
-# Override via environment variable
-export LIGHTMEM_MAX_BLOCK_SIZE=524288  # 512KB
+# Override via environment variable (value in MB)
+export LIGHTMEM_MAX_BLOCK_SIZE_MB=128  # Set to 128MB
 ```
 
 ### Storage Sharding

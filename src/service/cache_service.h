@@ -40,9 +40,9 @@ int64_t get_env_int64(const char *name) {
 }
 
 int64_t resolve_max_block_size_bytes() {
-  const int64_t env_override = get_env_int64(LM_MaxBlockSizeEnvVar);
-  if (env_override > 0) {
-    return env_override;
+  const int64_t env_override_mb = get_env_int64(LM_MaxBlockSizeEnvVar);
+  if (env_override_mb > 0) {
+    return env_override_mb * 1024ll * 1024ll;  // Convert MB to bytes
   }
   return LM_DefaultMaxBlockSizeBytes;
 }
