@@ -36,8 +36,6 @@ namespace cache::service {
  */
 class LocalCacheService : public CacheService {
 public:
-  LocalCacheService() = delete;
-
   /**
    * @brief Constructor
    * @param file Path to the local storage file
@@ -66,14 +64,9 @@ public:
     r_cpu_buffers_.reserve(num_workers_);
     w_cpu_buffers_.reserve(num_workers_);
 
-    try {
-      for (size_t i = 0; i < num_workers_; ++i) {
-        r_cpu_buffers_.emplace_back(new char[block_size_]);
-        w_cpu_buffers_.emplace_back(new char[block_size_]);
-      }
-    } catch (...) {
-      // unique_ptr will automatically clean up already allocated buffers
-      throw;
+    for (size_t i = 0; i < num_workers_; ++i) {
+      r_cpu_buffers_.emplace_back(std::make_unique<char[]>(block_size_));
+      w_cpu_buffers_.emplace_back(std::make_unique<char[]>(block_size_));
     }
   }
 
@@ -87,10 +80,6 @@ public:
         worker.join();
       }
     }
-
-    // unique_ptr will automatically delete the buffers
-    r_cpu_buffers_.clear();
-    w_cpu_buffers_.clear();
   }
 
   /**
@@ -101,10 +90,10 @@ public:
    * This function will throw no exception or error.
    */
   std::vector<bool> query(const std::vector<std::string> &hashs) override {
-    std::vector<bool> ret(hashs.size());
-    for (int32_t i = 0; i < hashs.size(); ++i) {
-      ret[i] = storage_->query(hashs[i]);
-    }
+    std::vector<bool> ret;
+    ret.reserve(hashs.size());
+    std::transform(hashs.begin(), hashs.end(), std::back_inserter(ret),
+                   [this](const auto &hash) { return storage_->query(hash); });
     return ret;
   }
 
@@ -170,7 +159,7 @@ protected:
       last_logged_bytes_ = total;
 
       const double total_gb = static_cast<double>(total) / (1024.0 * 1024.0 * 1024.0);
-      printf("[kvcache] cumulative disk write size: %.2f GB, recent write speed: %.2f GB/s\n", total_gb, speed_gbps);
+      printf("[light_mem] cumulative disk write size: %.2f GB, recent write speed: %.2f GB/s\n", total_gb, speed_gbps);
       return;
     }
 
@@ -226,7 +215,7 @@ protected:
     total_read_bytes_.store(0, std::memory_order_relaxed);      // Clear accumulated bytes
     first_read_time_ticks_.store(0, std::memory_order_relaxed); // Reset timing
     last_read_time_ticks_.store(0, std::memory_order_relaxed);  // Reset timing
-    printf("[kvcache] batch read size: %.2f GB, read speed: %.2f GB/s\n", delta_read_gb, speed_gbps);
+    printf("[light_mem] batch read size: %.2f GB, read speed: %.2f GB/s\n", delta_read_gb, speed_gbps);
   }
 
 private:
@@ -240,6 +229,8 @@ private:
         if (block != nullptr) {
           auto task = block->get_task();
           if (!task) {
+            fprintf(stderr, "[light_mem warning] worker %d: task has been destroyed for block with hash %s\n", index,
+                    block->hash.c_str());
             continue; // Task has been destroyed
           }
           char *cpu_buffer =
@@ -253,6 +244,8 @@ private:
   void processTask(CacheBlock *block, char *cpu_buffer) {
     auto task = block->get_task();
     if (!task) {
+      fprintf(stderr, "[light_mem warning] processTask: task has been destroyed for block with hash %s\n",
+              block->hash.c_str());
       return; // Task has been destroyed
     }
     torch::Tensor page_tensor = task->page_indexer;
@@ -262,6 +255,11 @@ private:
     const int64_t page_per_block = (static_cast<int64_t>(block_size_) + page_size - 1) / page_size;
     const int64_t remaining_pages = page_tensor.numel() - bid * page_per_block;
     if (remaining_pages <= 0) {
+      fprintf(stderr,
+              "[light_mem error] processTask: remaining_pages=%lld <= 0 for block %lld (hash=%s), "
+              "page_tensor.numel()=%lld, page_per_block=%lld\n",
+              static_cast<long long>(remaining_pages), static_cast<long long>(bid), block->hash.c_str(),
+              static_cast<long long>(page_tensor.numel()), static_cast<long long>(page_per_block));
       this->abort(block);
       return;
     }
@@ -294,16 +292,26 @@ private:
 
     const size_t read_bytes = storage_->read(cpu_buffer, block->hash);
     if (read_bytes != block_size_) {
+      // Only log if it's a real I/O error (partial read), not cache miss (read_bytes == 0)
+      if (read_bytes != 0) {
+        fprintf(stderr,
+                "[light_mem error] handleReadCpu: partial read for hash %s, expected %zu bytes, got %zu bytes\n",
+                block->hash.c_str(), block_size_, read_bytes);
+      }
       return false;
     }
 
     {
       auto task = block->get_task();
       if (!task) {
+        fprintf(stderr, "[light_mem warning] handleReadCpu: task has been destroyed for block with hash %s\n",
+                block->hash.c_str());
         return false;
       }
       std::lock_guard<std::mutex> lock(task->state_mutex);
       if (block->state != cache::task::State::Working) {
+        fprintf(stderr, "[light_mem warning] handleReadCpu: block state is not Working for hash %s, state=%d\n",
+                block->hash.c_str(), static_cast<int>(block->state));
         return false;
       }
     }
@@ -323,12 +331,16 @@ private:
   bool handleWriteCpu(CacheBlock *block, char *cpu_buffer, int32_t *page_ptr, int64_t num_of_page) {
     auto task = block->get_task();
     if (!task) {
+      fprintf(stderr, "[light_mem warning] handleWriteCpu: task has been destroyed for block with hash %s\n",
+              block->hash.c_str());
       return false; // Task has been destroyed
     }
 
     {
       std::lock_guard<std::mutex> lock(task->state_mutex);
       if (block->state != cache::task::State::Working) {
+        fprintf(stderr, "[light_mem warning] handleWriteCpu: block state is not Working for hash %s, state=%d\n",
+                block->hash.c_str(), static_cast<int>(block->state));
         return false;
       }
     }
@@ -352,6 +364,9 @@ private:
     // Step 2: Write to disk (this happens asynchronously and doesn't block page release)
     const size_t written = storage_->write(cpu_buffer, block->hash);
     if (written != block_size_ && written != 0) {
+      fprintf(stderr,
+              "[light_mem error] handleWriteCpu: write failed for hash %s, expected %zu or 0 bytes, got %zu bytes\n",
+              block->hash.c_str(), block_size_, written);
       return false;
     }
     if (written == block_size_) {
@@ -366,6 +381,20 @@ private:
     return true;
   }
 
+  /**
+   * @brief Scatter data from a continuous block buffer to KV cache pages in memory.
+   *
+   * This function is used during read operations to distribute data read from disk
+   * into the appropriate page locations in the KV cache tensor. Each page in the
+   * block buffer is copied to its corresponding destination page in the cache.
+   *
+   * @param info KV cache configuration containing base pointer, page sizes and strides
+   * @param block Source buffer containing continuous block data read from disk
+   * @param page_idx Array of destination page indices in the KV cache
+   * @param num_of_page Number of pages to scatter from the block
+   *
+   * @throws std::runtime_error if any page index is out of valid range
+   */
   static void cpu_scatter(const CacheParam_t &info, const char *block, const int32_t *page_idx, int64_t num_of_page) {
     const int64_t page_size = info.page_size;
     const int64_t num_of_layer = info.num_of_layer;
@@ -386,6 +415,20 @@ private:
     }
   }
 
+  /**
+   * @brief Gather data from KV cache pages in memory to a continuous block buffer.
+   *
+   * This function is used during write operations to collect data from scattered
+   * page locations in the KV cache tensor into a continuous buffer for disk writing.
+   * Each source page in the cache is copied to its corresponding position in the block.
+   *
+   * @param info KV cache configuration containing base pointer, page sizes and strides
+   * @param block Destination buffer to store the gathered continuous block data
+   * @param page_idx Array of source page indices in the KV cache
+   * @param num_of_page Number of pages to gather into the block
+   *
+   * @throws std::runtime_error if any page index is out of valid range
+   */
   static void cpu_gather(const CacheParam_t &info, char *block, const int32_t *page_idx, int64_t num_of_page) {
     const int64_t page_size = info.page_size;
     const int64_t num_of_layer = info.num_of_layer;

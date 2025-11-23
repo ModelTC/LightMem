@@ -273,6 +273,8 @@ public:
   void abort(cache::task::CacheBlock *block) {
     auto task = block->get_task();
     if (!task) {
+      fprintf(stderr, "[light_mem warning] abort: task has been destroyed for block with hash %s\n",
+              block->hash.c_str());
       return; // Task has been destroyed, nothing to do
     }
 
@@ -298,6 +300,8 @@ public:
   void deliver(cache::task::CacheBlock *block) {
     auto task = block->get_task();
     if (!task) {
+      fprintf(stderr, "[light_mem warning] deliver: task has been destroyed for block with hash %s\n",
+              block->hash.c_str());
       return; // Task has been destroyed, nothing to do
     }
 

@@ -25,7 +25,6 @@ namespace storage {
  */
 class LocalCacheIndex {
 public:
-  LocalCacheIndex() = delete;
   /**
    * @brief Constructor
    * @param capacity Maximum number of hash values to store
@@ -177,9 +176,7 @@ public:
     }
   }
 
-  ~LocalStorageEngine() override {
-    cleanup();
-  }
+  ~LocalStorageEngine() override { cleanup(); }
 
   bool query(const std::string &hash) override {
     size_t shard_id = getShard(hash);
@@ -218,7 +215,7 @@ public:
     size_t shard_id = getShard(hash);
 
     if (!caches_[shard_id]->exists(hash)) {
-      return 0; // Hash does not exist
+      return 0; // Hash does not exist (cache miss, expected behavior)
     }
 
     std::lock_guard<std::mutex> lock(*locks_[shard_id]);
@@ -255,8 +252,13 @@ private:
       if (files_[i].is_open()) {
         try {
           files_[i].close();
+        } catch (const std::exception &e) {
+          fprintf(stderr, "[light_mem warning] LocalStorageEngine::cleanup: failed to close file shard %zu: %s\n", i,
+                  e.what());
         } catch (...) {
-          // Ignore exceptions during cleanup
+          fprintf(stderr,
+                  "[light_mem warning] LocalStorageEngine::cleanup: failed to close file shard %zu: unknown error\n",
+                  i);
         }
       }
       if (file_fds_[i] >= 0) {
