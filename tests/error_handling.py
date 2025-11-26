@@ -28,8 +28,15 @@ def test_non_contiguous_tensor():
     """测试非连续内存张量"""
     try:
         kvcache = torch.zeros((100, 32, 128), dtype=torch.float16)
-        # 创建非连续张量
-        kvcache_non_contig = kvcache.transpose(0, 1)
+        # 创建真正的非连续张量（使用stride强制非连续）
+        # 原始: [100, 32, 128], 选择: [::2, :, :] 即每隔一个页面
+        kvcache_non_contig = kvcache[::2, :, :]  # shape=[50, 32, 128] 但stride不连续
+
+        # 双重确保非连续
+        if kvcache_non_contig.is_contiguous():
+            # 如果上面还是连续的，使用更激进的方式
+            kvcache_non_contig = kvcache.transpose(1, 2).transpose(0, 1)
+
         service = PyLocalCacheService(
             kvcache_tensor=kvcache_non_contig,
             file="cache/test_error",
@@ -54,7 +61,7 @@ def test_invalid_mode():
         num_shard=4,
         num_worker=2
     )
-    
+
     try:
         indexer = torch.arange(10, dtype=torch.int32)
         task = service.create(tokens=list(range(10)), kv_page_indexer=indexer, mode="invalid")
@@ -75,14 +82,14 @@ def test_index_out_of_range():
         num_shard=4,
         num_worker=2
     )
-    
+
     try:
         # 索引超出范围 (10个页面，索引15越界)
         indexer = torch.tensor([0, 1, 15], dtype=torch.int32)
         task = service.create(tokens=list(range(100)), kv_page_indexer=indexer, mode="w")
         while not task.ready():
             pass
-        
+
         # 检查是否有任务被中止
         states = task.state()
         has_abort = any(s.name == 'Aborted' for s in states)
@@ -107,7 +114,7 @@ def test_empty_tokens():
         num_shard=4,
         num_worker=2
     )
-    
+
     try:
         indexer = torch.tensor([], dtype=torch.int32)
         task = service.create(tokens=[], kv_page_indexer=indexer, mode="w")
@@ -130,7 +137,7 @@ def test_mismatched_indexer_length():
         num_shard=4,
         num_worker=2
     )
-    
+
     try:
         # tokens和indexer长度不匹配
         indexer = torch.arange(5, dtype=torch.int32)
@@ -147,7 +154,7 @@ def main():
     print("=" * 50)
     print("错误处理测试")
     print("=" * 50)
-    
+
     tests = [
         ("无效张量维度", test_invalid_tensor_dimension),
         ("非连续内存张量", test_non_contiguous_tensor),
@@ -156,7 +163,7 @@ def main():
         ("空token列表", test_empty_tokens),
         ("索引器长度不匹配", test_mismatched_indexer_length),
     ]
-    
+
     passed = 0
     for name, test_func in tests:
         print(f"\n测试: {name}")
@@ -165,7 +172,7 @@ def main():
                 passed += 1
         except Exception as e:
             print(f"✗ 测试异常: {e}")
-    
+
     print("\n" + "=" * 50)
     print(f"通过: {passed}/{len(tests)}")
     print("=" * 50)
