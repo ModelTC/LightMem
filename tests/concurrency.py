@@ -287,6 +287,156 @@ def test_concurrent_query():
     print("✓ 并发查询通过")
     return True
 
+def test_concurrent_write_read():
+    """测试并发写入时同时读取，验证读取要么成功（数据正确）要么miss，不能读到错误数据"""
+    kvcache = torch.zeros(size=[NUM_PAGES, NUM_LAYERS, PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()],
+                          dtype=DTYPE, device="cpu")
+    
+    # 为每个 page 设置特定的值
+    for i in range(NUM_PAGES):
+        kvcache[i].fill_(i + 1)
+    
+    backup = kvcache.clone()
+    
+    os.makedirs("cache", exist_ok=True)
+    service = PyLocalCacheService(
+        kvcache_tensor=kvcache,
+        file="cache/concurrent_write_read",
+        storage_size=5 * 1024**3,
+        num_shard=16,
+        num_worker=16,
+    )
+    
+    stop_event = threading.Event()
+    errors = []
+    token_info = {}
+    info_lock = threading.Lock()
+    
+    stats = {
+        "total_writes": 0,
+        "total_reads": 0,
+        "read_success": 0,
+        "read_miss": 0,
+        "data_match": 0,
+        "data_mismatch": 0,
+    }
+    stats_lock = threading.Lock()
+    
+    pages_per_writer = NUM_PAGES // 2
+    
+    def writer_task(tid):
+        count = 0
+        base_token = tid * 100000
+        page_start = tid * pages_per_writer
+        page_end = page_start + pages_per_writer
+        
+        while not stop_event.is_set() and count < 50:
+            try:
+                token_val = base_token + count
+                page_idx = page_start + (count % pages_per_writer)
+                
+                with info_lock:
+                    token_info[token_val] = {"page": page_idx, "status": "writing"}
+                
+                task = service.create(tokens=[token_val], kv_page_indexer=torch.tensor([page_idx], dtype=torch.int32), mode="w")
+                while not task.ready():
+                    time.sleep(0.0001)
+                
+                if all(s == PyState.Finished for s in task.state()):
+                    with info_lock:
+                        if token_val in token_info:
+                            token_info[token_val]["status"] = "written"
+                    with stats_lock:
+                        stats["total_writes"] += 1
+                else:
+                    with info_lock:
+                        token_info.pop(token_val, None)
+                
+                count += 1
+                time.sleep(0.01)
+            except Exception as e:
+                errors.append(f"Writer {tid}: {e}")
+                break
+    
+    def reader_task(tid):
+        count = 0
+        while not stop_event.is_set() and count < 100:
+            try:
+                with info_lock:
+                    if len(token_info) == 0:
+                        time.sleep(0.01)
+                        continue
+                    token_val = random.choice(list(token_info.keys()))
+                    token_data = token_info[token_val].copy()
+                
+                page_idx = token_data["page"]
+                expected_value = backup[page_idx]
+                
+                kvcache[page_idx].zero_()
+                task = service.create(tokens=[token_val], kv_page_indexer=torch.tensor([page_idx], dtype=torch.int32), mode="r")
+                
+                while not task.ready():
+                    time.sleep(0.0001)
+                
+                states = task.state()
+                
+                with stats_lock:
+                    stats["total_reads"] += 1
+                
+                if all(s == PyState.Finished for s in states):
+                    with stats_lock:
+                        stats["read_success"] += 1
+                    
+                    if torch.allclose(kvcache[page_idx], expected_value, rtol=1e-3):
+                        with stats_lock:
+                            stats["data_match"] += 1
+                    else:
+                        with stats_lock:
+                            stats["data_mismatch"] += 1
+                        errors.append(f"Reader {tid}: data mismatch for token {token_val}")
+                else:
+                    with stats_lock:
+                        stats["read_miss"] += 1
+                
+                count += 1
+                time.sleep(0.01)
+            except Exception as e:
+                errors.append(f"Reader {tid}: {e}")
+                break
+    
+    threads = []
+    for i in range(2):
+        t = threading.Thread(target=writer_task, args=(i,))
+        threads.append(t)
+        t.start()
+    
+    time.sleep(0.5)
+    
+    for i in range(4):
+        t = threading.Thread(target=reader_task, args=(i,))
+        threads.append(t)
+        t.start()
+    
+    time.sleep(3)
+    stop_event.set()
+    
+    for t in threads:
+        t.join(timeout=2)
+    
+    if errors:
+        print(f"✗ 并发写入读取: {len(errors)} 个错误")
+        for error in errors[:3]:
+            print(f"  {error}")
+        return False
+    
+    if stats["data_mismatch"] > 0:
+        print(f"✗ 并发写入读取: {stats['data_mismatch']} 次数据不匹配")
+        return False
+    
+    print(f"✓ 并发写入读取: 写入 {stats['total_writes']}, 读取 {stats['total_reads']} "
+          f"(成功 {stats['read_success']}, Miss {stats['read_miss']}, 匹配率 100%)")
+    return True
+
 def main():
     print("=" * 50)
     print("并发测试")
@@ -297,6 +447,7 @@ def main():
         ("并发读取", test_concurrent_reads),
         ("混合读写", test_mixed_read_write),
         ("并发查询", test_concurrent_query),
+        ("并发写入读取验证", test_concurrent_write_read),
     ]
 
     passed = 0

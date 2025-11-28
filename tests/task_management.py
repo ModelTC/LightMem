@@ -2,6 +2,7 @@
 """任务管理测试"""
 
 import os
+import sys
 import time
 import torch
 from light_mem import PyLocalCacheService, PyState
@@ -257,17 +258,26 @@ def main():
     ]
 
     passed = 0
+    failed = 0
     for name, test_func in tests:
         print(f"\n测试: {name}")
         try:
             if test_func():
                 passed += 1
+            else:
+                failed += 1
         except Exception as e:
             print(f"✗ 测试异常: {e}")
+            import traceback
+            traceback.print_exc()
+            failed += 1
 
     print("\n" + "=" * 50)
     print(f"通过: {passed}/{len(tests)}")
     print("=" * 50)
+
+    # 返回正确的退出码
+    sys.exit(0 if failed == 0 else 1)
 
 if __name__ == "__main__":
     main()

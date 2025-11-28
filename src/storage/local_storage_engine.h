@@ -45,9 +45,10 @@ public:
    * @return True if exists, false otherwise
    */
   bool exists(const std::string &hash) {
-    std::lock_guard<std::mutex> lock(lock_);
+    std::lock_guard<std::mutex> lock(index_lock_);
     auto it = index_.find(hash);
-    if (it == index_.end()) {
+    // Only return true if data is fully written and readable (not just allocated)
+    if (it == index_.end() || !it->second.ready || it->second.writing) {
       return false;
     }
     lru_list_.splice(lru_list_.begin(), lru_list_, it->second.lru_iterator);
@@ -55,7 +56,7 @@ public:
   }
 
   /**
-   * @brief Checkout a slot for a hash, allocating or reusing storage as needed.
+   * @brief Acquire a slot for a hash, allocating or reusing storage as needed.
    *
    * If the hash already exists, its offset is returned and the entry promoted to MRU.
    * If the hash is new and free space remains, a free offset is consumed.
@@ -64,17 +65,20 @@ public:
    * @param hash The hash value we wish to store.
    * @param offset Output parameter receiving the chosen file offset index.
    * @param evicted_hash Output parameter holding the evicted hash (empty if none).
-   * @return True if the hash was newly inserted (with or without eviction), false if it already existed.
+   * @return 1 if newly inserted, 0 if already existed, -1 if temporarily failed (all slots busy)
    */
-  bool checkout_slot(const std::string &hash, size_t &offset, std::string &evicted_hash) {
-    std::lock_guard<std::mutex> lock(lock_);
+  int acquire_slot(const std::string &hash, size_t &offset, std::string &evicted_hash) {
+    std::lock_guard<std::mutex> lock(index_lock_);
 
     auto existing = index_.find(hash);
     if (existing != index_.end()) {
+      if (existing->second.writing) {
+        return -1;  // Write in progress, caller should retry
+      }
       lru_list_.splice(lru_list_.begin(), lru_list_, existing->second.lru_iterator);
       offset = existing->second.foffset;
       evicted_hash.clear();
-      return false;
+      return 0;  // Already exists and ready
     }
 
     if (!empty_block_list_.empty()) {
@@ -82,38 +86,88 @@ public:
       empty_block_list_.pop_back();
       evicted_hash.clear();
     } else {
-      if (lru_list_.empty()) {
-        throw std::runtime_error("LocalCacheIndex capacity exhausted with no entries to evict");
+      // Need to evict a victim from LRU list
+      // Find a victim that is not currently being written (writing=false)
+      auto it = lru_list_.end();
+      bool found_victim = false;
+
+      while (it != lru_list_.begin()) {
+        --it;
+        const std::string &candidate_hash = *it;
+        auto candidate_it = index_.find(candidate_hash);
+
+        // Data structure inconsistency detected, return failure to avoid corruption
+        if (candidate_it == index_.end()) {
+          fprintf(stderr, "[light_mem error] LRU list and index inconsistent, returning failure\n");
+          return -1;
+        }
+
+        if (!candidate_it->second.writing) {
+          // Found a valid victim (not currently being written to disk)
+          offset = candidate_it->second.foffset;
+          evicted_hash = candidate_hash;
+          lru_list_.erase(it);
+          index_.erase(candidate_it);
+          found_victim = true;
+          break;
+        }
       }
-      const std::string &victim_hash = lru_list_.back();
-      auto victim_it = index_.find(victim_hash);
-      if (victim_it == index_.end()) {
-        throw std::runtime_error("LRU list and index inconsistent");
+
+      if (!found_victim) {
+        // All slots are busy writing or LRU list is empty
+        // This is temporary congestion, return -1 to let caller retry
+        return -1;
       }
-      offset = victim_it->second.foffset;
-      evicted_hash = victim_hash;
-      lru_list_.pop_back();
-      index_.erase(victim_it);
     }
 
     lru_list_.push_front(hash);
-    index_[hash] = {lru_list_.begin(), offset};
-    return true;
+    index_[hash] = {lru_list_.begin(), offset, false, true}; // Not ready, writing in progress
+    return 1;  // Newly inserted
   }
 
   /**
    * @brief Gets the offset of a hash value
    *
    * @param hash The hash value to search for
-   * @return The offset if exists, -1 otherwise
+   * @return The offset if exists and ready, -1 otherwise
    */
   size_t get_offset(const std::string &hash) {
-    std::lock_guard<std::mutex> lock(lock_);
+    std::lock_guard<std::mutex> lock(index_lock_);
     auto it = index_.find(hash);
-    if (it == index_.end()) {
+    if (it == index_.end() || !it->second.ready || it->second.writing) {
       return -1;
     } else {
       return it->second.foffset;
+    }
+  }
+
+  /**
+   * @brief Mark a hash as ready (data written to disk and readable)
+   * @return true if the slot is still valid, false if it was evicted
+   */
+  bool mark_ready(const std::string &hash) {
+    std::lock_guard<std::mutex> lock(index_lock_);
+    auto it = index_.find(hash);
+    if (it != index_.end()) {
+      it->second.ready = true;
+      it->second.writing = false;
+      return true;
+    }
+    return false; // Slot was evicted during write
+  }
+
+  /**
+   * @brief Remove a hash entry and recycle its slot
+   * Used for cleaning up failed writes to prevent zombie slots
+   */
+  void remove(const std::string &hash) {
+    std::lock_guard<std::mutex> lock(index_lock_);
+    auto it = index_.find(hash);
+    if (it != index_.end()) {
+      size_t offset = it->second.foffset;
+      lru_list_.erase(it->second.lru_iterator);
+      index_.erase(it);
+      empty_block_list_.push_back(offset);
     }
   }
 
@@ -124,20 +178,22 @@ private:
   struct IndexEntry {
     std::list<std::string>::iterator lru_iterator;
     size_t foffset; // File pointer
+    bool ready;     // Data is written to disk and readable
+    bool writing;   // Slot is allocated but disk write in progress (evictable but not readable)
   };
 
   size_t capacity_;                                   ///< Maximum number of hash values to store
   std::list<std::string> lru_list_;                   ///< LRU list, head is most recent, tail is least recently used
   std::list<size_t> empty_block_list_;                ///< List of free disk blocks
   std::unordered_map<std::string, IndexEntry> index_; ///< Map from hash value to IndexEntry
-  std::mutex lock_;
+  std::mutex index_lock_;                              ///< Mutex protecting index data structures
 };
 
 class LocalStorageEngine : public StorageEngine {
 public:
   struct HashInfo {
     std::vector<std::shared_ptr<LocalCacheIndex>> caches;
-    std::vector<std::shared_ptr<std::mutex>> locks;
+    std::vector<std::shared_ptr<std::mutex>> io_locks;
 
     HashInfo() = default;
   };
@@ -159,14 +215,14 @@ public:
 
     // 初始化缓存索引、锁和文件对象
     caches_.resize(shard_);
-    locks_.resize(shard_);
+    io_locks_.resize(shard_);
     files_.resize(shard_);
     file_fds_.resize(shard_, -1);
 
     try {
       for (size_t i = 0; i < shard_; i++) {
         caches_[i] = std::make_shared<LocalCacheIndex>(shard_capacity);
-        locks_[i] = std::make_shared<std::mutex>();
+        io_locks_[i] = std::make_shared<std::mutex>();
       }
       createOrOpenFiles(shard_storage_size);
     } catch (...) {
@@ -187,21 +243,29 @@ public:
     size_t shard_id = getShard(hash);
     size_t slot = 0;
     std::string evicted_hash;
-    bool is_new = caches_[shard_id]->checkout_slot(hash, slot, evicted_hash);
+    int result = caches_[shard_id]->acquire_slot(hash, slot, evicted_hash);
     (void)evicted_hash;
 
-    // 如果hash已存在（is_new为false），跳过实际的磁盘写入操作
-    // 返回 0 以便调用方能够感知到这次写入是被去重跳过的
-    if (!is_new) {
+    // result: 1=newly inserted, 0=already exists, -1=temporarily failed
+    if (result <= 0) {
       return 0;
     }
 
-    // 只有新hash才执行实际的磁盘写入
-    std::lock_guard<std::mutex> lock(*locks_[shard_id]);
+    // 执行磁盘写入，持有 writing=true 防止槽位被驱逐
     size_t offset = slot * block_size_;
-    files_[shard_id].seekp(offset, std::ios::beg);
-    files_[shard_id].write(buf, block_size_);
-    files_[shard_id].flush();
+    try {
+      std::lock_guard<std::mutex> lock(*io_locks_[shard_id]);
+      files_[shard_id].seekp(offset, std::ios::beg);
+      files_[shard_id].write(buf, block_size_);
+      files_[shard_id].flush();
+
+      // 写入完成后立即标记为 ready，同时释放 writing 标志
+      caches_[shard_id]->mark_ready(hash);
+    } catch (...) {
+      // 写入失败，清理槽位防止僵尸状态，返回 0 表示失败（不抛异常）
+      caches_[shard_id]->remove(hash);
+      return 0;  // Write failed, let caller retry
+    }
 
     // 立即丢弃新写入的页缓存，避免污染读缓存
     // Note: posix_fadvise is not available on macOS
@@ -216,34 +280,44 @@ public:
 
   size_t read(char *buf, const std::string &hash) override {
     size_t shard_id = getShard(hash);
-
-    if (!caches_[shard_id]->exists(hash)) {
-      return 0; // Hash does not exist (cache miss, expected behavior)
+    std::lock_guard<std::mutex> lock(*io_locks_[shard_id]);
+    size_t block_idx = caches_[shard_id]->get_offset(hash);
+    if (block_idx == static_cast<size_t>(-1)) {
+      return 0;  // Hash does not exist or was evicted (cache miss)
     }
 
-    std::lock_guard<std::mutex> lock(*locks_[shard_id]);
-    size_t offset = caches_[shard_id]->get_offset(hash) * block_size_;
-    files_[shard_id].seekg(offset, std::ios::beg);
-    files_[shard_id].read(buf, block_size_);
-    return block_size_;
+    size_t offset = block_idx * block_size_;
+    try {
+      files_[shard_id].seekg(offset, std::ios::beg);
+      files_[shard_id].read(buf, block_size_);
+      return block_size_;
+    } catch (...) {
+      // I/O error during read, return 0 (read failed, treat as cache miss)
+      fprintf(stderr, "[light_mem error] read: I/O error for hash %s at offset %zu\n", hash.c_str(), offset);
+      return 0;
+    }
   }
 
   std::shared_ptr<HashInfo> getHashInfo() {
     auto info = std::make_shared<HashInfo>();
     info->caches = caches_;
-    info->locks = locks_;
+    info->io_locks = io_locks_;
     return info;
   }
 
-  void setHashInfo(const std::shared_ptr<HashInfo> &info) {
+  bool setHashInfo(const std::shared_ptr<HashInfo> &info) {
     if (!info) {
-      throw std::runtime_error("HashInfo is null");
+      fprintf(stderr, "[light_mem error] setHashInfo: HashInfo is null\n");
+      return false;
     }
-    if (info->caches.size() != shard_ || info->locks.size() != shard_) {
-      throw std::runtime_error("HashInfo shard size mismatch");
+    if (info->caches.size() != shard_ || info->io_locks.size() != shard_) {
+      fprintf(stderr, "[light_mem error] setHashInfo: shard size mismatch (expected %zu, got caches=%zu io_locks=%zu)\n",
+              shard_, info->caches.size(), info->io_locks.size());
+      return false;
     }
     caches_ = info->caches;
-    locks_ = info->locks;
+    io_locks_ = info->io_locks;
+    return true;
   }
 
 private:
@@ -299,8 +373,8 @@ private:
   size_t shard_;
   size_t block_size_;
   std::vector<std::fstream> files_;
-  std::vector<int> file_fds_; ///< 原生文件描述符，用于 posix_fadvise
-  std::vector<std::shared_ptr<std::mutex>> locks_;
+  std::vector<int> file_fds_;                          ///< 原生文件描述符，用于 posix_fadvise
+  std::vector<std::shared_ptr<std::mutex>> io_locks_; ///< Per-shard mutexes protecting file I/O operations
   std::vector<std::shared_ptr<LocalCacheIndex>> caches_;
 };
 

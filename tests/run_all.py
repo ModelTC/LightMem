@@ -41,6 +41,7 @@ def main():
         "task_management.py",   # 任务管理
         "abort.py",             # 中止功能
         "concurrency.py",       # 并发测试（最后，最耗时）
+        "mixed_lru.py",         # 混合读写+LRU压力测试
     ]
     
     tests_dir = Path(__file__).parent

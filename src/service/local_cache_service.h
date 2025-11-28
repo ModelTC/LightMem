@@ -301,21 +301,6 @@ private:
       return false;
     }
 
-    {
-      auto task = block->get_task();
-      if (!task) {
-        fprintf(stderr, "[light_mem warning] handleReadCpu: task has been destroyed for block with hash %s\n",
-                block->hash.c_str());
-        return false;
-      }
-      std::lock_guard<std::mutex> lock(task->state_mutex);
-      if (block->state != cache::task::State::Working) {
-        fprintf(stderr, "[light_mem warning] handleReadCpu: block state is not Working for hash %s, state=%d\n",
-                block->hash.c_str(), static_cast<int>(block->state));
-        return false;
-      }
-    }
-
     total_read_bytes_.fetch_add(static_cast<uint64_t>(read_bytes), std::memory_order_relaxed);
 
     cpu_scatter(this->cache_info_, cpu_buffer, page_ptr, num_of_page);
@@ -336,15 +321,6 @@ private:
       return false; // Task has been destroyed
     }
 
-    {
-      std::lock_guard<std::mutex> lock(task->state_mutex);
-      if (block->state != cache::task::State::Working) {
-        fprintf(stderr, "[light_mem warning] handleWriteCpu: block state is not Working for hash %s, state=%d\n",
-                block->hash.c_str(), static_cast<int>(block->state));
-        return false;
-      }
-    }
-
     // Record start time before the first write operation begins
     if (first_write_time_ticks_.load(std::memory_order_relaxed) == 0) {
       const auto now_duration = std::chrono::steady_clock::now().time_since_epoch();
@@ -363,12 +339,23 @@ private:
 
     // Step 2: Write to disk (this happens asynchronously and doesn't block page release)
     const size_t written = storage_->write(cpu_buffer, block->hash);
+
+    // Handle different write results:
+    // - written == block_size_: Success, new data written
+    // - written == 0: Skipped (already exists, failed, or temporary congestion)
+    // - other values: Partial write error (should not happen)
     if (written != block_size_ && written != 0) {
       fprintf(stderr,
-              "[light_mem error] handleWriteCpu: write failed for hash %s, expected %zu or 0 bytes, got %zu bytes\n",
+              "[light_mem error] handleWriteCpu: partial write for hash %s, expected %zu or 0 bytes, got %zu bytes\n",
               block->hash.c_str(), block_size_, written);
       return false;
     }
+
+    // If written == 0, it means:
+    // 1. Hash already exists (deduplication)
+    // 2. Temporary failure (all slots busy, I/O error)
+    // 3. Write was skipped
+    // This is acceptable for cache operations - treat as success to avoid abort
     if (written == block_size_) {
       total_written_bytes_.fetch_add(static_cast<uint64_t>(written), std::memory_order_relaxed);
     }
@@ -378,7 +365,7 @@ private:
     const int64_t now_ticks = static_cast<int64_t>(now_duration.count());
     last_write_time_ticks_.store(now_ticks, std::memory_order_relaxed);
 
-    return true;
+    return true;  // Success or acceptable skip
   }
 
   /**
