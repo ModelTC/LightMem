@@ -12,14 +12,14 @@ VOCABS = 180000
 PAGE_SIZE = 16384
 NUM_PAGES = 128
 NUM_LAYERS = 60
-DTYPE = torch.half
+DTYPE = torch.uint8
 
 ELEMENT_BYTES = torch.tensor([], dtype=DTYPE).element_size()
 if PAGE_SIZE % ELEMENT_BYTES != 0:
     raise ValueError(f"PAGE_SIZE={PAGE_SIZE} 必须是 {DTYPE} 字节数 {ELEMENT_BYTES} 的整数倍")
 
 page_elements = PAGE_SIZE // ELEMENT_BYTES
-kvcache = torch.rand(size=[NUM_PAGES, NUM_LAYERS, page_elements], dtype=DTYPE, device="cpu")
+kvcache = torch.randint(0, 10, size=[NUM_PAGES, NUM_LAYERS * page_elements], dtype=DTYPE, device="cpu")
 kvcache_backup = kvcache.clone()
 
 os.makedirs("cache", exist_ok=True)

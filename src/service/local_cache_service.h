@@ -251,8 +251,8 @@ private:
     torch::Tensor page_tensor = task->page_indexer;
     auto bid = block->block_idx;
 
-    const int64_t page_size = this->cache_info_.page_size * this->cache_info_.num_of_layer;
-    const int64_t page_per_block = (static_cast<int64_t>(block_size_) + page_size - 1) / page_size;
+    const int64_t page_size = this->cache_info_.page_size;
+    const int64_t page_per_block = static_cast<int64_t>(block_size_) / page_size;
     const int64_t remaining_pages = page_tensor.numel() - bid * page_per_block;
     if (remaining_pages <= 0) {
       fprintf(stderr,
@@ -384,10 +384,9 @@ private:
    */
   static void cpu_scatter(const CacheParam_t &info, const char *block, const int32_t *page_idx, int64_t num_of_page) {
     const int64_t page_size = info.page_size;
-    const int64_t num_of_layer = info.num_of_layer;
     const int64_t page_stride = info.page_stride;
     const int64_t total_pages = info.num_of_page;
-    const int64_t page_bytes = page_size * num_of_layer;
+    const int64_t page_bytes = page_size;
 
     for (int64_t local_page = 0; local_page < num_of_page; ++local_page) {
       const int32_t dst_page = page_idx[local_page];
@@ -418,10 +417,9 @@ private:
    */
   static void cpu_gather(const CacheParam_t &info, char *block, const int32_t *page_idx, int64_t num_of_page) {
     const int64_t page_size = info.page_size;
-    const int64_t num_of_layer = info.num_of_layer;
     const int64_t page_stride = info.page_stride;
     const int64_t total_pages = info.num_of_page;
-    const int64_t page_bytes = page_size * num_of_layer;
+    const int64_t page_bytes = page_size;
 
     for (int64_t local_page = 0; local_page < num_of_page; ++local_page) {
       const int32_t src_page = page_idx[local_page];

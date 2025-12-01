@@ -7,7 +7,7 @@ from light_mem import PyLocalCacheService, PyState
 
 def test_single_page():
     """测试单页操作"""
-    kvcache = torch.rand((10, 32, 128), dtype=torch.float16)
+    kvcache = torch.rand((10, 32 * 128), dtype=torch.float16).view(dtype=torch.uint8)
     backup = kvcache.clone()
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(
@@ -39,7 +39,7 @@ def test_single_page():
 
 def test_zero_start_pos():
     """测试start_pos=0"""
-    kvcache = torch.rand((50, 32, 128), dtype=torch.float16)
+    kvcache = torch.rand((50, 32 * 128), dtype=torch.float16).view(dtype=torch.uint8)
     backup = kvcache.clone()
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(
@@ -82,7 +82,7 @@ def test_zero_start_pos():
 
 def test_non_zero_start_pos():
     """测试非零start_pos"""
-    kvcache = torch.rand((50, 32, 128), dtype=torch.float16)
+    kvcache = torch.rand((50, 32 * 128), dtype=torch.float16).view(dtype=torch.uint8)
     backup = kvcache.clone()
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(
@@ -150,7 +150,7 @@ def test_non_zero_start_pos():
 def test_boundary_page_index():
     """测试边界页索引"""
     NUM_PAGES = 50
-    kvcache = torch.rand((NUM_PAGES, 32, 128), dtype=torch.float16)
+    kvcache = torch.rand((NUM_PAGES, 32 * 128), dtype=torch.float16).view(dtype=torch.uint8)
     backup = kvcache.clone()
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(
@@ -189,7 +189,7 @@ def test_boundary_page_index():
 
 def test_all_same_page():
     """测试所有操作指向同一页"""
-    kvcache = torch.rand((50, 32, 128), dtype=torch.float16)
+    kvcache = torch.rand((50, 32 * 128), dtype=torch.float16).view(dtype=torch.uint8)
     backup = kvcache.clone()
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(
@@ -233,7 +233,7 @@ def test_all_same_page():
 
 def test_sequential_pages():
     """测试连续页面"""
-    kvcache = torch.rand((100, 32, 128), dtype=torch.float16)
+    kvcache = torch.rand((100, 32 * 128), dtype=torch.float16).view(dtype=torch.uint8)
     backup = kvcache.clone()
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(
@@ -268,7 +268,7 @@ def test_sequential_pages():
 def test_max_pages():
     """测试最大页面数"""
     NUM_PAGES = 512
-    kvcache = torch.rand((NUM_PAGES, 32, 128), dtype=torch.float16)
+    kvcache = torch.rand((NUM_PAGES, 32*128), dtype=torch.float16).view(dtype=torch.uint8)
     backup = kvcache.clone()
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(

@@ -74,7 +74,7 @@ class PyLocalCacheService:
     ):
         """ 使用 PyLocalCacheService 来创建异步数据存取引擎 (基于本地磁盘)
     PyLocalCacheService 会直接从 kv cache 中读取数据，并异步地向 kv cache 中写入数据
-    kv cache tensor 必须是三维张量，形如 [num of page, num of layer, page size]
+    kv cache tensor 必须是二维张量，形如 [num of page, page size], 类型为 uint8
     kv cache tensor 必须是连续内存
     kv cache tensor 必须是 CPU 张量
 
@@ -82,16 +82,15 @@ class PyLocalCacheService:
             file (str): 本地文件位置
             num_shard(int): 本地文件分片数量
             storage_size (int): 本地文件大小 (本地文件是分片存储的，这里表示总大小)
-            kvcache_tensor (torch.Tensor): kvcache tensor，维度顺序为 [page, layer, stride]
+            kvcache_tensor (torch.Tensor): kvcache tensor，维度顺序为 [page, stride]
             num_worker (int): 工作线程数量
         """
-        if kvcache_tensor.dim() != 3:
-            raise ValueError("kvcache_tensor 必须是三维张量，形如 [num of page, num of layer, page size]")
+        if kvcache_tensor.dim() != 2:
+            raise ValueError("kvcache_tensor 必须是二维张量，形如 [num of page, page size]")
         if kvcache_tensor.is_cuda:
             raise ValueError("kvcache_tensor 必须是 CPU 张量，GPU 流程已移除")
 
         num_pages_total = kvcache_tensor.shape[0]
-        num_layers = kvcache_tensor.shape[1]
 
         self._c = light_mem.LocalCacheService(
             file=file,
@@ -101,11 +100,10 @@ class PyLocalCacheService:
             num_workers=num_worker,
         )
         self._c.run()
-        self._num_of_layer: int = num_layers
         self._num_of_page_total: int = num_pages_total
         self._block_size: int = int(self._c.block_size())
         self._page_size: int = int(self._c.page_size())
-        self._n: int = ceil(self._block_size / (self._page_size * self._num_of_layer))
+        self._n: int = self._block_size // self._page_size
 
     def hash(self, tokens: List[int]) -> List[str]:
         """将 tokens 数组按照长度 n 进行划分，并计算哈希值。

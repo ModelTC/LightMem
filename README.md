@@ -108,7 +108,7 @@ from light_mem import LocalCacheService
 
 # Create a CPU-based KV cache tensor
 # Shape: [num_pages, num_layers, page_size]
-kv_cache = torch.zeros((1000, 40, 8192), dtype=torch.float16)
+kv_cache = torch.zeros((1000, 40 * 8192), dtype=torch.float16).view(dtype=torch.uint8)
 
 # Initialize cache service
 cache_service = LocalCacheService(

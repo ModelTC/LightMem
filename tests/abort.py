@@ -6,17 +6,16 @@ import torch
 from light_mem import PyLocalCacheService, PyState
 
 FILE_SIZE = 32 * (1024**3)
-PAGE_SIZE = 64
+PAGE_SIZE = 64 * 60
 NUM_PAGES = 12800
-NUM_LAYERS = 60
-DTYPE = torch.half
+DTYPE = torch.uint8
 
 ELEMENT_BYTES = torch.tensor([], dtype=DTYPE).element_size()
 if PAGE_SIZE % ELEMENT_BYTES != 0:
     raise ValueError(f"PAGE_SIZE={PAGE_SIZE} 必须是 {DTYPE} 字节数 {ELEMENT_BYTES} 的整数倍")
 
 page_elements = PAGE_SIZE // ELEMENT_BYTES
-kvcache = torch.rand(size=[NUM_PAGES, NUM_LAYERS, page_elements], dtype=DTYPE, device="cpu")
+kvcache = torch.randint(0, 10, size=[NUM_PAGES, page_elements], dtype=DTYPE, device="cpu")
 
 os.makedirs("cache", exist_ok=True)
 service = PyLocalCacheService(

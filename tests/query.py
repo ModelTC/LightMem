@@ -8,7 +8,7 @@ from light_mem import PyLocalCacheService
 
 def test_query_existing():
     """测试查询已存在的数据"""
-    kvcache = torch.rand((100, 32, 128), dtype=torch.float16)
+    kvcache = torch.rand((100, 32 * 128), dtype=torch.float16).view(dtype=torch.uint8)
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(
         kvcache_tensor=kvcache,
@@ -47,7 +47,7 @@ def test_query_existing():
 
 def test_query_non_existing():
     """测试查询不存在的数据"""
-    kvcache = torch.zeros((100, 32, 128), dtype=torch.float16)
+    kvcache = torch.zeros((100, 32 * 128), dtype=torch.float16).view(dtype=torch.uint8)
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(
         kvcache_tensor=kvcache,
@@ -67,7 +67,7 @@ def test_query_non_existing():
 
 def test_query_partial_hit():
     """测试部分命中查询"""
-    kvcache = torch.rand((100, 32, 128), dtype=torch.float16)
+    kvcache = torch.rand((100, 32 * 128), dtype=torch.float16).view(dtype=torch.uint8)
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(
         kvcache_tensor=kvcache,
@@ -94,7 +94,7 @@ def test_query_partial_hit():
 
 def test_query_empty():
     """测试空查询"""
-    kvcache = torch.zeros((100, 32, 128), dtype=torch.float16)
+    kvcache = torch.zeros((100, 32 * 128), dtype=torch.float16).view(dtype=torch.uint8)
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(
         kvcache_tensor=kvcache,
@@ -115,7 +115,7 @@ def test_query_empty():
 
 def test_query_large_batch():
     """测试大批量查询"""
-    kvcache = torch.rand((100, 32, 128), dtype=torch.float16)
+    kvcache = torch.rand((100, 32 * 128), dtype=torch.float16).view(dtype=torch.uint8)
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(
         kvcache_tensor=kvcache,
@@ -142,7 +142,7 @@ def test_query_large_batch():
 
 def test_query_repeated():
     """测试重复查询"""
-    kvcache = torch.rand((100, 32, 128), dtype=torch.float16)
+    kvcache = torch.rand((100, 32 * 128), dtype=torch.float16).view(dtype=torch.uint8)
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(
         kvcache_tensor=kvcache,

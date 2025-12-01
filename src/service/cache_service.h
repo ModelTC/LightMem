@@ -54,15 +54,13 @@ namespace cache::service {
 struct alignas(8) CacheParam_t {
   char *base_ptr;
   int64_t page_size;
-  int64_t num_of_layer;
-  int64_t layer_stride;
   int64_t page_stride;
   int64_t num_of_page;
 
-  CacheParam_t() : base_ptr(nullptr), page_size(0), num_of_layer(0), layer_stride(0), page_stride(0), num_of_page(0) {}
+  CacheParam_t() : base_ptr(nullptr), page_size(0), page_stride(0), num_of_page(0) {}
 
-  CacheParam_t(char *ptr, int64_t page, int64_t layer, int64_t layer_strd, int64_t page_strd, int64_t pages)
-      : base_ptr(ptr), page_size(page), num_of_layer(layer), layer_stride(layer_strd), page_stride(page_strd),
+  CacheParam_t(char *ptr, int64_t page_size, int64_t page_strd, int64_t pages)
+      : base_ptr(ptr), page_size(page_size), page_stride(page_strd),
         num_of_page(pages) {}
 };
 
@@ -76,9 +74,13 @@ public:
   explicit CacheService(const torch::Tensor &kvcache)
       : queue_(std::make_unique<cache::queue::TaskQueue>()), cache_info_(), block_size_(0) {
 
-    if (kvcache.dim() != 3) {
-      throw std::runtime_error("The input kv-cache tensor has an incorrect dimension; it must be a 3D tensor of shape "
-                               "[num page, num layer, page size].");
+    if (kvcache.dtype() != torch::kUInt8) {
+      throw std::runtime_error("The input kv-cache tensor must be a tensor of type uint8.");
+    }
+
+    if (kvcache.dim() != 2) {
+      throw std::runtime_error("The input kv-cache tensor has an incorrect dimension; it must be a 2D tensor of shape "
+                               "[num page, page size].");
     }
 
     if (kvcache.is_cuda()) {
@@ -93,28 +95,24 @@ public:
     const auto sizes = kvcache.sizes();
     const auto strides = kvcache.strides();
 
-    int64_t num_layers = 0;
     int64_t num_pages = 0;
-    int64_t layer_stride = 0;
     int64_t page_stride = 0;
 
-    num_layers = sizes[1];
     num_pages = sizes[0];
-    if (strides[2] != 1 || strides[1] != sizes[2]) {
+    if (strides[1] != 1) {
       throw std::runtime_error("Page-major kv-cache tensor must have contiguous layer dimension.");
     }
-    if (strides[0] != sizes[1] * sizes[2]) {
+    if (strides[0] != sizes[1]) {
       throw std::runtime_error("Page-major kv-cache tensor must be contiguous along the page dimension.");
     }
 
-    layer_stride = strides[1] * element_size;
     page_stride = strides[0] * element_size;
 
-    const int64_t inferred_page_size = sizes[2] * element_size;
+    const int64_t inferred_page_size = sizes[1] * element_size;
     cache_info_ =
-        CacheParam_t((char *)kvcache.data_ptr(), inferred_page_size, num_layers, layer_stride, page_stride, num_pages);
+        CacheParam_t((char *)kvcache.data_ptr(), inferred_page_size, page_stride, num_pages);
 
-    const int64_t page_bytes = cache_info_.page_size * cache_info_.num_of_layer;
+    const int64_t page_bytes = cache_info_.page_size;
     const int64_t block_limit = resolve_max_block_size_bytes();
 
     int64_t pages_per_block = std::max<int64_t>(1, LM_TokensPerBlock);
@@ -125,10 +123,8 @@ public:
     block_size_ = page_bytes * pages_per_block;
 
     printf("CacheService created with following cache info: \n");
-    printf("\tNum of layer: %lld \n", static_cast<long long>(cache_info_.num_of_layer));
     printf("\tNum of page: %lld \n", static_cast<long long>(cache_info_.num_of_page));
     printf("\tPage Size: %lld \n", static_cast<long long>(cache_info_.page_size));
-    printf("\tLayer Stride: %lld \n", static_cast<long long>(cache_info_.layer_stride));
     printf("\tPage Stride: %lld \n", static_cast<long long>(cache_info_.page_stride));
     printf("\tPages Per Block: %lld \n", static_cast<long long>(pages_per_block));
     printf("\tBlock Size: %lld \n", static_cast<long long>(block_size_));
@@ -179,8 +175,8 @@ public:
     }
 
     // Split task into blocks
-    const int64_t page_size = cache_info_.page_size * cache_info_.num_of_layer;
-    const int64_t page_per_block = (block_size_ + page_size - 1) / page_size;
+    const int64_t page_size = cache_info_.page_size;
+    const int64_t page_per_block = block_size_ / page_size;
     const int64_t num_of_pages = kv_page_indexer_.numel();
     const int64_t num_of_blocks = (num_of_pages + page_per_block - 1) / page_per_block;
 

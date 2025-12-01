@@ -11,9 +11,9 @@ def test_single_page_integrity():
     PAGE_SIZE = 16384
     NUM_PAGES = 128
     NUM_LAYERS = 60
-    DTYPE = torch.half
+    DTYPE = torch.uint8
     
-    kvcache = torch.rand(size=[NUM_PAGES, NUM_LAYERS, PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()], 
+    kvcache = torch.randint(0, 10, size=[NUM_PAGES, NUM_LAYERS * PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()], 
                          dtype=DTYPE, device="cpu")
     backup = kvcache.clone()
     os.makedirs("cache", exist_ok=True)
@@ -62,9 +62,9 @@ def test_multiple_pages_integrity():
     PAGE_SIZE = 16384
     NUM_PAGES = 128
     NUM_LAYERS = 60
-    DTYPE = torch.half
+    DTYPE = torch.uint8
     
-    kvcache = torch.rand(size=[NUM_PAGES, NUM_LAYERS, PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()], 
+    kvcache = torch.randint(0, 10, size=[NUM_PAGES, NUM_LAYERS * PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()], 
                          dtype=DTYPE, device="cpu")
     backup = kvcache.clone()
     os.makedirs("cache", exist_ok=True)
@@ -109,9 +109,9 @@ def test_overwrite_integrity():
     PAGE_SIZE = 16384
     NUM_PAGES = 128
     NUM_LAYERS = 60
-    DTYPE = torch.half
+    DTYPE = torch.uint8
     
-    kvcache = torch.rand(size=[NUM_PAGES, NUM_LAYERS, PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()], 
+    kvcache = torch.randint(0, 10, size=[NUM_PAGES, NUM_LAYERS * PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()], 
                          dtype=DTYPE, device="cpu")
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(
@@ -134,7 +134,7 @@ def test_overwrite_integrity():
         pass
     
     # 修改数据并使用不同 token 写入
-    kvcache[10] = torch.rand_like(kvcache[10])
+    kvcache[10] = torch.randint(0, 10, size=kvcache[10].shape, dtype=DTYPE)
     second_data = kvcache[10].clone()
     task = service.create(tokens=tokens2, kv_page_indexer=indexer, mode="w")
     while not task.ready():
@@ -159,9 +159,9 @@ def test_random_access_integrity():
     PAGE_SIZE = 16384
     NUM_PAGES = 128
     NUM_LAYERS = 60
-    DTYPE = torch.half
+    DTYPE = torch.uint8
     
-    kvcache = torch.rand(size=[NUM_PAGES, NUM_LAYERS, PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()], 
+    kvcache = torch.randint(0, 10, size=[NUM_PAGES, NUM_LAYERS * PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()], 
                          dtype=DTYPE, device="cpu")
     backup = kvcache.clone()
     os.makedirs("cache", exist_ok=True)
@@ -206,9 +206,9 @@ def test_large_scale_integrity():
     PAGE_SIZE = 16384
     NUM_PAGES = 256
     NUM_LAYERS = 60
-    DTYPE = torch.half
+    DTYPE = torch.uint8
     
-    kvcache = torch.rand(size=[NUM_PAGES, NUM_LAYERS, PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()], 
+    kvcache = torch.randint(0, 10, size=[NUM_PAGES, NUM_LAYERS * PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()], 
                          dtype=DTYPE, device="cpu")
     backup = kvcache.clone()
     os.makedirs("cache", exist_ok=True)

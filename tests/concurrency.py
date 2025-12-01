@@ -11,11 +11,11 @@ from light_mem import PyLocalCacheService, PyState
 PAGE_SIZE = 16384
 NUM_PAGES = 256
 NUM_LAYERS = 60
-DTYPE = torch.half
+DTYPE = torch.uint8
 
 def test_concurrent_writes():
     """测试并发写入"""
-    kvcache = torch.rand(size=[NUM_PAGES, NUM_LAYERS, PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()],
+    kvcache = torch.randint(0, 10, size=[NUM_PAGES, NUM_LAYERS * PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()],
                          dtype=DTYPE, device="cpu")
     backup = kvcache.clone()
     os.makedirs("cache", exist_ok=True)
@@ -96,7 +96,7 @@ def test_concurrent_writes():
 
 def test_concurrent_reads():
     """测试并发读取"""
-    kvcache = torch.rand(size=[NUM_PAGES, NUM_LAYERS, PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()],
+    kvcache = torch.randint(0, 10, size=[NUM_PAGES, NUM_LAYERS * PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()],
                          dtype=DTYPE, device="cpu")
     backup = kvcache.clone()
     os.makedirs("cache", exist_ok=True)
@@ -181,7 +181,7 @@ def test_concurrent_reads():
 
 def test_mixed_read_write():
     """测试混合读写"""
-    kvcache = torch.rand(size=[NUM_PAGES, NUM_LAYERS, PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()],
+    kvcache = torch.randint(0, 10, size=[NUM_PAGES, NUM_LAYERS * PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()],
                          dtype=DTYPE, device="cpu")
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(
@@ -249,7 +249,7 @@ def test_mixed_read_write():
 
 def test_concurrent_query():
     """测试并发查询"""
-    kvcache = torch.zeros((100, 32, 128), dtype=torch.float16)
+    kvcache = torch.zeros((100, 32 * 128), dtype=torch.float16).view(dtype=torch.uint8)
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(
         kvcache_tensor=kvcache,
@@ -289,12 +289,12 @@ def test_concurrent_query():
 
 def test_concurrent_write_read():
     """测试并发写入时同时读取，验证读取要么成功（数据正确）要么miss，不能读到错误数据"""
-    kvcache = torch.zeros(size=[NUM_PAGES, NUM_LAYERS, PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()],
+    kvcache = torch.zeros(size=[NUM_PAGES, NUM_LAYERS * PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()],
                           dtype=DTYPE, device="cpu")
     
     # 为每个 page 设置特定的值
     for i in range(NUM_PAGES):
-        kvcache[i].fill_(i + 1)
+        kvcache[i].fill_((i + 1) % 10)
     
     backup = kvcache.clone()
     

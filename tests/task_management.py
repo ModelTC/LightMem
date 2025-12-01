@@ -12,9 +12,9 @@ def test_data_safe_write():
     PAGE_SIZE = 16384
     NUM_PAGES = 128
     NUM_LAYERS = 60
-    DTYPE = torch.half
+    DTYPE = torch.uint8
 
-    kvcache = torch.rand(size=[NUM_PAGES, NUM_LAYERS, PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()],
+    kvcache = torch.randint(0, 10, size=[NUM_PAGES, NUM_LAYERS * PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()],
                          dtype=DTYPE, device="cpu")
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(
@@ -49,9 +49,9 @@ def test_data_safe_read():
     PAGE_SIZE = 16384
     NUM_PAGES = 128
     NUM_LAYERS = 60
-    DTYPE = torch.half
+    DTYPE = torch.uint8
 
-    kvcache = torch.rand(size=[NUM_PAGES, NUM_LAYERS, PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()],
+    kvcache = torch.randint(0, 10, size=[NUM_PAGES, NUM_LAYERS * PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()],
                          dtype=DTYPE, device="cpu")
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(
@@ -90,9 +90,9 @@ def test_page_already_list():
     PAGE_SIZE = 16384
     NUM_PAGES = 128
     NUM_LAYERS = 60
-    DTYPE = torch.half
+    DTYPE = torch.uint8
 
-    kvcache = torch.rand(size=[NUM_PAGES, NUM_LAYERS, PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()],
+    kvcache = torch.randint(0, 10, size=[NUM_PAGES, NUM_LAYERS * PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()],
                          dtype=DTYPE, device="cpu")
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(
@@ -133,7 +133,7 @@ def test_page_already_list():
 
 def test_task_state_progression():
     """测试任务状态转换"""
-    kvcache = torch.rand((100, 32, 128), dtype=torch.float16)
+    kvcache = torch.rand((100, 32 * 128), dtype=torch.float16).view(dtype=torch.uint8)
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(
         kvcache_tensor=kvcache,
@@ -170,7 +170,7 @@ def test_task_state_progression():
 
 def test_multiple_tasks():
     """测试多任务管理"""
-    kvcache = torch.rand((100, 32, 128), dtype=torch.float16)
+    kvcache = torch.rand((100, 32 * 128), dtype=torch.float16).view(dtype=torch.uint8)
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(
         kvcache_tensor=kvcache,
@@ -206,9 +206,9 @@ def test_abort_task():
     PAGE_SIZE = 16384
     NUM_PAGES = 256
     NUM_LAYERS = 60
-    DTYPE = torch.half
+    DTYPE = torch.uint8
 
-    kvcache = torch.rand(size=[NUM_PAGES, NUM_LAYERS, PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()],
+    kvcache = torch.randint(0, 10, size=[NUM_PAGES, NUM_LAYERS * PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()],
                          dtype=DTYPE, device="cpu")
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(

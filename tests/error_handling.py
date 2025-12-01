@@ -10,7 +10,7 @@ def test_invalid_tensor_dimension():
     """测试无效的张量维度"""
     try:
         # 2D tensor instead of 3D
-        kvcache = torch.zeros((100, 128), dtype=torch.float16)
+        kvcache = torch.zeros((100, 1, 128), dtype=torch.float16).view(dtype=torch.uint8)
         service = PyLocalCacheService(
             kvcache_tensor=kvcache,
             file="cache/test_error",
@@ -27,10 +27,9 @@ def test_invalid_tensor_dimension():
 def test_non_contiguous_tensor():
     """测试非连续内存张量"""
     try:
-        kvcache = torch.zeros((100, 32, 128), dtype=torch.float16)
+        kvcache = torch.zeros((100, 32 * 128), dtype=torch.float16).view(dtype=torch.uint8)
         # 创建真正的非连续张量（使用stride强制非连续）
-        # 原始: [100, 32, 128], 选择: [::2, :, :] 即每隔一个页面
-        kvcache_non_contig = kvcache[::2, :, :]  # shape=[50, 32, 128] 但stride不连续
+        kvcache_non_contig = kvcache[::2, :]
 
         # 双重确保非连续
         if kvcache_non_contig.is_contiguous():
@@ -52,7 +51,7 @@ def test_non_contiguous_tensor():
 
 def test_invalid_mode():
     """测试无效的模式字符串"""
-    kvcache = torch.zeros((100, 32, 128), dtype=torch.float16)
+    kvcache = torch.zeros((100, 32 * 128), dtype=torch.float16).view(dtype=torch.uint8)
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(
         kvcache_tensor=kvcache,
@@ -73,7 +72,7 @@ def test_invalid_mode():
 
 def test_index_out_of_range():
     """测试索引越界"""
-    kvcache = torch.zeros((10, 32, 128), dtype=torch.float16)
+    kvcache = torch.zeros((10, 32 * 128), dtype=torch.float16).view(dtype=torch.uint8)
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(
         kvcache_tensor=kvcache,
@@ -105,7 +104,7 @@ def test_index_out_of_range():
 
 def test_empty_tokens():
     """测试空token列表"""
-    kvcache = torch.zeros((100, 32, 128), dtype=torch.float16)
+    kvcache = torch.zeros((100, 32 * 128), dtype=torch.float16).view(dtype=torch.uint8)
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(
         kvcache_tensor=kvcache,
@@ -128,7 +127,7 @@ def test_empty_tokens():
 
 def test_mismatched_indexer_length():
     """测试索引器长度不匹配"""
-    kvcache = torch.zeros((100, 32, 128), dtype=torch.float16)
+    kvcache = torch.zeros((100, 32 * 128), dtype=torch.float16).view(dtype=torch.uint8)
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(
         kvcache_tensor=kvcache,

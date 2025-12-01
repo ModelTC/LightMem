@@ -15,7 +15,7 @@ from light_mem import PyLocalCacheService, PyState
 # 配置参数
 PAGE_SIZE = 16384  # 16KB
 NUM_LAYERS = 32    # 层数
-DTYPE = torch.half # float16 (2 bytes)
+DTYPE = torch.uint8 # uint8 (1 bytes)
 NUM_PAGES = 1024   # 总页数
 
 # 划分 Source 和 Dest 区域
@@ -32,7 +32,7 @@ def test_mixed_lru_stability():
     last_dim = PAGE_SIZE // element_size
 
     # 初始化为全 0
-    kvcache = torch.zeros(size=[NUM_PAGES, NUM_LAYERS, last_dim],
+    kvcache = torch.zeros(size=[NUM_PAGES, NUM_LAYERS * last_dim],
                           dtype=DTYPE, device="cpu")
 
     # 填充 Source 区域为确定性数据
@@ -40,7 +40,7 @@ def test_mixed_lru_stability():
     print("填充 Source 区域数据...")
     for i in range(SOURCE_START, SOURCE_END):
         # 使用 fill_ 填充
-        kvcache[i].fill_(i % 2048)
+        kvcache[i].fill_(i % 10)
 
     # 2. 清理并创建缓存目录
     cache_dir = "cache/mixed_lru"
@@ -218,7 +218,7 @@ def test_mixed_lru_stability():
                 if all(s == PyState.Finished for s in task_states):
                     # 验证数据
                     # 检查 kvcache[dest_page_idx] 是否全等于 expected_page_idx % 2048
-                    expected_val = expected_page_idx % 2048
+                    expected_val = expected_page_idx % 10
 
                     # 使用 torch.all 进行严格的全量检查
                     # 注意：kvcache 是 half 类型，expected_val 是 int

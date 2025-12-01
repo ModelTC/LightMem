@@ -80,7 +80,7 @@ def benchmark(service, token_lengths, num_iterations=100):
 
 
 def main():
-    kvcache = torch.zeros((100, 32, 128), dtype=torch.float16)
+    kvcache = torch.zeros((100, 32 * 128), dtype=torch.float16).view(dtype=torch.uint8)
     service = PyLocalCacheService(
         kvcache_tensor=kvcache,
         file="/tmp/lightmem_hash_test",
