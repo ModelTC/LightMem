@@ -1,0 +1,21 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# IDE
+/.cache
+/.vscode
+
+# Generated
+*.so
+*.build
+*.log
+.py-build-cmake_cache/
+third_party/grpc/
