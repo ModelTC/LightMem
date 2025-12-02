@@ -100,36 +100,48 @@ Controls the maximum size of each cache block in megabytes (MB).
 
 ## Quick Start
 
+### Key Concepts
+
+**Tokens, Pages, and Blocks:**
+- Each **token** corresponds to one **page** in the KV cache (one-to-one mapping via `kv_page_indexer`)
+- Tokens are automatically grouped into **blocks** for I/O operations
+- **Block size** = `LIGHTMEM_MAX_BLOCK_SIZE_MB` (default 64MB)
+- **Pages per block** = block_size / page_size
+- Example: With 64MB blocks and 16KB pages, each block contains ~4096 pages (tokens)
+- Hash values are computed per block, not per token
+
 ### Basic Usage
 
 ```python
 import torch
-from light_mem import LocalCacheService
+from light_mem import PyLocalCacheService
 
 # Create a CPU-based KV cache tensor
-# Shape: [num_pages, num_layers, page_size]
+# Shape: [num_pages, page_size] - must be 2D uint8 tensor
 kv_cache = torch.zeros((1000, 40 * 8192), dtype=torch.float16).view(dtype=torch.uint8)
 
 # Initialize cache service
-cache_service = LocalCacheService(
+cache_service = PyLocalCacheService(
+    kvcache_tensor=kv_cache,     # KV cache tensor (2D uint8)
     file="./cache_storage",      # Storage directory
     storage_size=10 * 1024**3,   # 10GB storage limit
-    num_of_shard=4,              # Number of storage shards
-    kvcache=kv_cache,            # KV cache tensor
-    num_workers=8                # Number of worker threads
+    num_shard=4,                 # Number of storage shards
+    num_worker=8                 # Number of worker threads
 )
 
-# Start the service
-cache_service.run()
+# Service starts automatically after initialization
 
-# Query if a cache exists
-exists = cache_service.query("hash_key")
+# Query if caches exist (returns list of booleans)
+# Pass token list - hashes are computed automatically
+tokens = [100, 200, 300, 400]  # Example token IDs
+exists_list = cache_service.query(tokens)
 
 # Create write/read tasks
+# Note: tokens and kv_page_indexer must have the same length (one-to-one mapping)
 task = cache_service.create(
-    mode="write",                 # or "read"
-    hash_values=["hash1", "hash2"],
-    page_indices=[0, 1]
+    tokens=tokens,                # List of token IDs
+    kv_page_indexer=torch.tensor([0, 1, 2, 3], dtype=torch.int32),  # Page indices (same length as tokens)
+    mode="w"                      # "w" for write, "r" for read
 )
 
 # Check task status
@@ -141,13 +153,13 @@ if task.ready():
 
 ```python
 # Check task state
-states = task.state()  # Returns state for each block
+states = task.state()  # Returns PyState enum list for each block
 
 # Abort a running task
 cache_service.abort(task)
 
-# Get pages already cached on disk
-cached_pages = task.get_page_already_list()
+# Get pages already cached on disk (write mode only)
+cached_pages = task.page_already_list  # Property, not method
 
 # Check if data is safe to modify (for write tasks)
 if task.data_safe():
@@ -157,15 +169,24 @@ if task.data_safe():
 
 ## Architecture
 
-### Storage Layer
+LightMem has a layered architecture with C++ core and Python bindings:
+
+### Python Layer
+- **PyLocalCacheService**: Main Python interface for cache operations
+- **PyTask**: Python wrapper for task management
+- **PyState**: Enum for task state tracking (Initial, Working, Finished, Aborted)
+
+### C++ Core (Internal)
+
+#### Storage Layer
 - **StorageEngine**: Abstract interface for pluggable storage backends
 - **LocalStorageEngine**: File-based storage implementation with sharding support
 
-### Service Layer
+#### Service Layer
 - **CacheService**: Base class defining cache service interface
 - **LocalCacheService**: Concrete implementation managing local disk cache
 
-### Task Processing
+#### Task Processing
 - **CacheTask**: Represents a complete read/write operation
 - **CacheBlock**: Individual block within a task, processed independently
 - **TaskQueue**: Thread pool managing asynchronous task execution
@@ -183,7 +204,7 @@ export LIGHTMEM_MAX_BLOCK_SIZE_MB=128  # Set to 128MB
 ### Storage Sharding
 Distribute cache files across multiple shards for better I/O parallelism:
 ```python
-num_of_shard=8  # Creates 8 separate storage files
+num_shard=8  # Creates 8 separate storage files
 ```
 
 ## Performance Considerations
@@ -195,29 +216,55 @@ num_of_shard=8  # Creates 8 separate storage files
 
 ## API Reference
 
-### LocalCacheService
+### PyLocalCacheService
 
 #### Constructor
 ```python
-LocalCacheService(file: str, storage_size: int, num_of_shard: int, 
-                  kvcache: torch.Tensor, num_workers: int)
+PyLocalCacheService(
+    kvcache_tensor: torch.Tensor,
+    file: str,
+    storage_size: int = 32 * 1024**3,  # Default: 32GB
+    num_shard: int = 32,
+    num_worker: int = 16
+)
 ```
+**Parameters:**
+- `kvcache_tensor`: 2D uint8 tensor with shape `[num_pages, page_size]`, must be CPU and contiguous
+- `file`: Path to storage directory/file
+- `storage_size`: Total storage size in bytes (distributed across shards)
+- `num_shard`: Number of storage file shards
+- `num_worker`: Number of worker threads
 
 #### Methods
-- `run()`: Start the cache service worker threads
-- `query(hash: str) -> bool`: Check if cache exists
-- `create(mode: str, hash_values: List[str], page_indices: List[int]) -> Task`: Create cache task
-- `abort(task: Task)`: Cancel a running task
-- `block_size() -> int`: Get block size in bytes
-- `page_size() -> int`: Get page size in bytes
+- `hash(tokens: List[int]) -> List[str]`: Compute hash values for token list
+  - Tokens are automatically grouped into blocks (n tokens per block, where n = block_size / page_size)
+  - Returns one hash string per block
+  - Example: 100 tokens with n=4096 → returns 1 hash (since 100 < 4096)
+  - Example: 5000 tokens with n=4096 → returns 2 hashes (4096 + 904 tokens)
+- `query(tokens: List[int]) -> List[bool]`: Check if caches exist for tokens, returns list of booleans
+  - Returns one boolean per block (not per token)
+  - Use `hash(tokens)` to see how many blocks are queried
+- `create(tokens: List[int], kv_page_indexer: torch.Tensor, mode: str, start_pos: int = 0) -> PyTask`: Create cache task
+  - `tokens`: List of token IDs (hashes computed automatically)
+  - `kv_page_indexer`: Int32 tensor containing page indices, **must have the same length as tokens** (one-to-one mapping)
+  - `mode`: `"w"` for write, `"r"` for read
+  - `start_pos`: Optional starting position in token list (default: 0)
+- `abort(task: PyTask)`: Cancel a running task
+- `active_threads(mode: str) -> int`: Get count of active read/write tasks (`"w"` or `"r"`)
 
-### Task
+### PyTask
 
 #### Methods
 - `ready() -> bool`: Check if all blocks are finished
-- `data_safe() -> bool`: Check if source data can be safely modified
-- `state() -> List[State]`: Get state of each block
-- `get_page_already_list() -> List[int]`: Get list of cached page indices
+- `data_safe() -> bool`: Check if source data can be safely modified (write: data copied; read: equivalent to ready())
+- `state() -> List[PyState]`: Get PyState enum for each block
+  - `PyState.Initial` (0): Task just created
+  - `PyState.Working` (1): Task in progress
+  - `PyState.Finished` (2): Task completed successfully
+  - `PyState.Aborted` (3): Task aborted (possibly due to error)
+
+#### Properties
+- `page_already_list -> List[int]`: Get list of page indices already on disk (write mode: pages found in cache via hash query)
 
 ## Contributing
 
