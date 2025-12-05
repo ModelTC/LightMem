@@ -102,13 +102,15 @@ Controls the maximum size of each cache block in megabytes (MB).
 
 ### Key Concepts
 
-**Tokens, Pages, and Blocks:**
-- Each **token** corresponds to one **page** in the KV cache (one-to-one mapping via `kv_page_indexer`)
-- Tokens are automatically grouped into **blocks** for I/O operations
+**Data, Hashes, Pages, and Blocks:**
+- Each **data element** is hashed using 128-bit cumulative hashing (xxHash3)
+- Each **cumulative hash** corresponds to one **page** in the KV cache (one-to-one mapping via `kv_page_indexer`)
+- **Cumulative hash**: Each position contains the hash of all data from the start up to that position
+- Hashes are automatically grouped into **blocks** for I/O operations
 - **Block size** = `LIGHTMEM_MAX_BLOCK_SIZE_MB` (default 64MB)
 - **Pages per block** = block_size / page_size
-- Example: With 64MB blocks and 16KB pages, each block contains ~4096 pages (tokens)
-- Hash values are computed per block, not per token
+- Example: With 64MB blocks and 16KB pages, each block contains ~4096 pages
+- For block operations: The last cumulative hash of each block represents the entire block
 
 ### Basic Usage
 
@@ -131,16 +133,17 @@ cache_service = PyLocalCacheService(
 
 # Service starts automatically after initialization
 
+# Compute cumulative hashes from data
+hash_128s = [hash_1, hash_2, hash_3, hash_4]  # list of 128-bit integers (cumulative hashes)
+
 # Query if caches exist (returns list of booleans)
-# Pass token list - hashes are computed automatically
-tokens = [100, 200, 300, 400]  # Example token IDs
-exists_list = cache_service.query(tokens)
+exists_list = cache_service.query(hash_128s)
 
 # Create write/read tasks
-# Note: tokens and kv_page_indexer must have the same length (one-to-one mapping)
+# Note: hash_128s and kv_page_indexer must have the same length (one-to-one mapping)
 task = cache_service.create(
-    tokens=tokens,                # List of token IDs
-    kv_page_indexer=torch.tensor([0, 1, 2, 3], dtype=torch.int32),  # Page indices (same length as tokens)
+    hash_128s=hash_128s,          # List of 128-bit cumulative hash integers
+    kv_page_indexer=torch.tensor([0, 1, 2, 3], dtype=torch.int32),  # Page indices (same length as hash_128s)
     mode="w"                      # "w" for write, "r" for read
 )
 
@@ -236,17 +239,13 @@ PyLocalCacheService(
 - `num_worker`: Number of worker threads
 
 #### Methods
-- `hash(tokens: List[int]) -> List[str]`: Compute hash values for token list
-  - Tokens are automatically grouped into blocks (n tokens per block, where n = block_size / page_size)
-  - Returns one hash string per block
-  - Example: 100 tokens with n=4096 → returns 1 hash (since 100 < 4096)
-  - Example: 5000 tokens with n=4096 → returns 2 hashes (4096 + 904 tokens)
-- `query(tokens: List[int]) -> List[bool]`: Check if caches exist for tokens, returns list of booleans
-  - Returns one boolean per block (not per token)
-  - Use `hash(tokens)` to see how many blocks are queried
-- `create(tokens: List[int], kv_page_indexer: torch.Tensor, mode: str, start_pos: int = 0) -> PyTask`: Create cache task
-  - `tokens`: List of token IDs (hashes computed automatically)
-  - `kv_page_indexer`: Int32 tensor containing page indices, **must have the same length as tokens** (one-to-one mapping)
+- `query(hash_128s: List[int]) -> List[bool]`: Check if caches exist for given cumulative hashes
+  - Input: List of 128-bit cumulative hash integers
+  - Returns one boolean per block (not per hash)
+  - Data is grouped into blocks internally based on block_size / page_size
+- `create(hash_128s: List[int], kv_page_indexer: torch.Tensor, mode: str, start_pos: int = 0) -> PyTask`: Create cache task
+  - `hash_128s`: List of 128-bit cumulative hash integers
+  - `kv_page_indexer`: Int32 tensor containing page indices, **must have the same length as hash_128s** (one-to-one mapping)
   - `mode`: `"w"` for write, `"r"` for read
   - `start_pos`: Optional starting position in token list (default: 0)
 - `abort(task: PyTask)`: Cancel a running task

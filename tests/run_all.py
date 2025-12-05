@@ -31,7 +31,6 @@ def run_test(test_file):
 def main():
     # 测试文件列表（按优先级排序）
     test_files = [
-        "hash.py",              # 基础功能
         "error_handling.py",    # 错误处理
         "boundary.py",          # 边界条件
         "query.py",             # 查询功能

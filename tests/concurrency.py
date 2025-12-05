@@ -7,6 +7,7 @@ import threading
 import time
 import torch
 from light_mem import PyLocalCacheService, PyState
+from test_utils import generate_cumulative_hashes
 
 PAGE_SIZE = 16384
 NUM_PAGES = 256
@@ -39,13 +40,14 @@ def test_concurrent_writes():
             end_page = start_page + pages_per_thread
             num_pages = end_page - start_page
 
-            tokens = [random.randint(0, 100000) + thread_id * 1000000 for _ in range(num_pages)]
+            data = [random.randint(0, 100000) + thread_id * 1000000 for _ in range(num_pages)]
+            hash_128s = generate_cumulative_hashes(data)
             indexer = torch.arange(start_page, end_page, dtype=torch.int32)
 
-            task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="w")
+            task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="w")
             while not task.ready():
                 time.sleep(0.001)
-            tasks.append((task, tokens, indexer))
+            tasks.append((task, hash_128s, indexer))
         except Exception as e:
             errors.append(f"Thread {thread_id}: {e}")
 
@@ -69,8 +71,8 @@ def test_concurrent_writes():
     kvcache.zero_()
 
     # 读取所有写入的数据
-    for _, tokens, indexer in tasks:
-        task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="r")
+    for _, hash_128s, indexer in tasks:
+        task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="r")
         while not task.ready():
             pass
 
@@ -115,9 +117,11 @@ def test_concurrent_reads():
     for i in range(num_threads):
         start_page = i * pages_per_thread
         end_page = start_page + pages_per_thread
-        tokens = list(range(i * 1000, i * 1000 + (end_page - start_page)))
+        data = list(range(i * 1000, i * 1000 + (end_page - start_page)))
+
+        hash_128s = generate_cumulative_hashes(data)
         indexer = torch.arange(start_page, end_page, dtype=torch.int32)
-        task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="w")
+        task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="w")
         while not task.ready():
             pass
 
@@ -134,10 +138,11 @@ def test_concurrent_reads():
             end_page = start_page + pages_per_thread
 
             # 读取对应的数据
-            tokens = list(range(thread_id * 1000, thread_id * 1000 + (end_page - start_page)))
+            data = list(range(thread_id * 1000, thread_id * 1000 + (end_page - start_page)))
+            hash_128s = generate_cumulative_hashes(data)
             idx = torch.arange(start_page, end_page, dtype=torch.int32)
 
-            task = service.create(tokens=tokens, kv_page_indexer=idx, mode="r")
+            task = service.create(hash_128s=hash_128s, kv_page_indexer=idx, mode="r")
             while not task.ready():
                 time.sleep(0.001)
             tasks.append(task)
@@ -195,9 +200,10 @@ def test_mixed_read_write():
     # 先写入一些基础数据供读取
     base_tokens_count = 20
     for i in range(base_tokens_count):
-        tokens = [i * 1000]
+        data = [i * 1000]
+        hash_128s = generate_cumulative_hashes(data)
         indexer = torch.tensor([i % NUM_PAGES], dtype=torch.int32)
-        task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="w")
+        task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="w")
         while not task.ready():
             pass
 
@@ -212,18 +218,21 @@ def test_mixed_read_write():
                 if j < 2:
                     mode = "w"
                     token_base = thread_id * 10000 + j * 1000
-                    tokens = [token_base + k for k in range(10)]
-                    write_token_sets.append(tokens)
+                    data = [token_base + k for k in range(10)]
+                    hash_128s = generate_cumulative_hashes(data)
+                    write_token_sets.append(data)
                 else:
                     mode = "r"
                     # 读取之前写入的数据
                     if thread_id < base_tokens_count:
-                        tokens = [thread_id * 1000]
+                        data = [thread_id * 1000]
+                        hash_128s = generate_cumulative_hashes(data)
                     else:
-                        tokens = [random.randint(0, base_tokens_count - 1) * 1000]
+                        data = [random.randint(0, base_tokens_count - 1) * 1000]
+                        hash_128s = generate_cumulative_hashes(data)
 
-                indexer = torch.tensor([random.randint(0, NUM_PAGES - 1) for _ in range(len(tokens))], dtype=torch.int32)
-                task = service.create(tokens=tokens, kv_page_indexer=indexer, mode=mode)
+                indexer = torch.tensor([random.randint(0, NUM_PAGES - 1) for _ in range(len(data))], dtype=torch.int32)
+                task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode=mode)
                 while not task.ready():
                     time.sleep(0.001)
                 tasks.append(task)
@@ -264,8 +273,9 @@ def test_concurrent_query():
     def query_task(thread_id):
         try:
             for _ in range(20):
-                tokens = [random.randint(0, 10000) for _ in range(random.randint(10, 100))]
-                result = service.query(tokens)
+                data = [random.randint(0, 10000) for _ in range(random.randint(10, 100))]
+                hash_128s = generate_cumulative_hashes(data)
+                result = service.query(hash_128s)
                 if not isinstance(result, list):
                     errors.append(f"Thread {thread_id}: Invalid result type")
         except Exception as e:
@@ -338,7 +348,8 @@ def test_concurrent_write_read():
                 with info_lock:
                     token_info[token_val] = {"page": page_idx, "status": "writing"}
                 
-                task = service.create(tokens=[token_val], kv_page_indexer=torch.tensor([page_idx], dtype=torch.int32), mode="w")
+                hash_128s_val = generate_cumulative_hashes([token_val])
+                task = service.create(hash_128s=hash_128s_val, kv_page_indexer=torch.tensor([page_idx], dtype=torch.int32), mode="w")
                 while not task.ready():
                     time.sleep(0.0001)
                 
@@ -372,8 +383,9 @@ def test_concurrent_write_read():
                 page_idx = token_data["page"]
                 expected_value = backup[page_idx]
                 
+                hash_128s_val = generate_cumulative_hashes([token_val])
                 kvcache[page_idx].zero_()
-                task = service.create(tokens=[token_val], kv_page_indexer=torch.tensor([page_idx], dtype=torch.int32), mode="r")
+                task = service.create(hash_128s=hash_128s_val, kv_page_indexer=torch.tensor([page_idx], dtype=torch.int32), mode="r")
                 
                 while not task.ready():
                     time.sleep(0.0001)
