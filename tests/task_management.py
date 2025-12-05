@@ -6,6 +6,7 @@ import sys
 import time
 import torch
 from light_mem import PyLocalCacheService, PyState
+from test_utils import generate_cumulative_hashes
 
 def test_data_safe_write():
     """测试写模式下的data_safe功能"""
@@ -25,10 +26,10 @@ def test_data_safe_write():
         num_worker=4,
     )
 
-    tokens = list(range(50))
+    data = list(range(50))
+    hash_128s = generate_cumulative_hashes(data)
     indexer = torch.arange(50, dtype=torch.int32)
-
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="w")
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="w")
 
     # data_safe应该在数据拷贝完成后立即返回True，无需等待磁盘写入
     max_wait = 100
@@ -62,17 +63,18 @@ def test_data_safe_read():
         num_worker=4,
     )
 
-    tokens = list(range(30))
+    data = list(range(30))
+    hash_128s = generate_cumulative_hashes(data)
     indexer = torch.arange(30, dtype=torch.int32)
 
     # 先写入
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="w")
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="w")
     while not task.ready():
         pass
 
     # 读取
     kvcache.zero_()
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="r")
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="r")
 
     # 读模式下data_safe等同于ready
     while not task.ready():
@@ -103,16 +105,17 @@ def test_page_already_list():
         num_worker=4,
     )
 
-    tokens = list(range(20))
+    data = list(range(20))
+    hash_128s = generate_cumulative_hashes(data)
     indexer = torch.arange(20, dtype=torch.int32)
 
     # 第一次写入
-    task1 = service.create(tokens=tokens, kv_page_indexer=indexer, mode="w")
+    task1 = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="w")
     while not task1.ready():
         pass
 
     # 第二次写入相同的tokens（应该在disk cache中已存在）
-    task2 = service.create(tokens=tokens, kv_page_indexer=indexer, mode="w")
+    task2 = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="w")
     while not task2.ready():
         pass
 
@@ -143,10 +146,11 @@ def test_task_state_progression():
         num_worker=4,
     )
 
-    tokens = list(range(50))
+    data = list(range(50))
+    hash_128s = generate_cumulative_hashes(data)
     indexer = torch.arange(50, dtype=torch.int32)
 
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="w")
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="w")
 
     # 检查初始状态
     initial_states = task.state()
@@ -182,9 +186,10 @@ def test_multiple_tasks():
 
     tasks = []
     for i in range(10):
-        tokens = list(range(i * 10, (i + 1) * 10))
+        data = list(range(i * 10, (i + 1) * 10))
+        hash_128s = generate_cumulative_hashes(data)
         indexer = torch.arange(10, dtype=torch.int32)
-        task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="w")
+        task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="w")
         tasks.append(task)
 
     # 等待所有任务完成
@@ -220,9 +225,10 @@ def test_abort_task():
     )
 
     # 创建大任务
-    tokens = list(range(200))
+    data = list(range(200))
+    hash_128s = generate_cumulative_hashes(data)
     indexer = torch.arange(200, dtype=torch.int32)
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="w")
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="w")
 
     # 立即中止
     time.sleep(0.05)  # 让任务开始执行

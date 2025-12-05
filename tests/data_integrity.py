@@ -5,6 +5,7 @@ import os
 import random
 import torch
 from light_mem import PyLocalCacheService, PyState
+from test_utils import generate_cumulative_hashes
 
 def test_single_page_integrity():
     """测试单页数据完整性"""
@@ -27,10 +28,11 @@ def test_single_page_integrity():
     
     # 写入单个页面
     page_idx = random.randint(0, NUM_PAGES - 1)
-    tokens = [12345]
+    data = [12345]
+    hash_128s = generate_cumulative_hashes(data)
     indexer = torch.tensor([page_idx], dtype=torch.int32)
     
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="w")
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="w")
     while not task.ready():
         pass
     
@@ -40,7 +42,7 @@ def test_single_page_integrity():
     
     # 清空并读回
     kvcache.zero_()
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="r")
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="r")
     while not task.ready():
         pass
     
@@ -78,16 +80,17 @@ def test_multiple_pages_integrity():
     
     # 写入多个页面
     num_test_pages = 20
-    tokens = list(range(num_test_pages))
+    data = list(range(num_test_pages))
+
+    hash_128s = generate_cumulative_hashes(data)
     indexer = torch.arange(num_test_pages, dtype=torch.int32)
-    
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="w")
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="w")
     while not task.ready():
         pass
     
     # 清空并读回
     kvcache.zero_()
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="r")
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="r")
     while not task.ready():
         pass
     
@@ -122,27 +125,29 @@ def test_overwrite_integrity():
         num_worker=4,
     )
     
-    # 使用不同的 token 值避免 hash 冲突
-    tokens1 = [99999]
-    tokens2 = [88888]  # 不同的 token，确保不会读取缓存
+    # 使用不同的数据值避免 hash 冲突
+    data1 = [99999]
+    data2 = [88888]  # 不同的数据，确保不会读取缓存
+    hash_128s_1 = generate_cumulative_hashes(data1)
+    hash_128s_2 = generate_cumulative_hashes(data2)
     indexer = torch.tensor([10], dtype=torch.int32)
     
     # 第一次写入
     first_data = kvcache[10].clone()
-    task = service.create(tokens=tokens1, kv_page_indexer=indexer, mode="w")
+    task = service.create(hash_128s=hash_128s_1, kv_page_indexer=indexer, mode="w")
     while not task.ready():
         pass
     
-    # 修改数据并使用不同 token 写入
+    # 修改数据并使用不同 hash 写入
     kvcache[10] = torch.randint(0, 10, size=kvcache[10].shape, dtype=DTYPE)
     second_data = kvcache[10].clone()
-    task = service.create(tokens=tokens2, kv_page_indexer=indexer, mode="w")
+    task = service.create(hash_128s=hash_128s_2, kv_page_indexer=indexer, mode="w")
     while not task.ready():
         pass
     
     # 清空并读回第二次写入的数据
     kvcache.zero_()
-    task = service.create(tokens=tokens2, kv_page_indexer=indexer, mode="r")
+    task = service.create(hash_128s=hash_128s_2, kv_page_indexer=indexer, mode="r")
     while not task.ready():
         pass
     
@@ -175,16 +180,18 @@ def test_random_access_integrity():
     
     # 随机选择页面写入
     test_indices = random.sample(range(NUM_PAGES), 30)
-    tokens = [random.randint(0, 100000) for _ in test_indices]
+    data = [random.randint(0, 100000) for _ in test_indices]
+
+    hash_128s = generate_cumulative_hashes(data)
     indexer = torch.tensor(test_indices, dtype=torch.int32)
     
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="w")
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="w")
     while not task.ready():
         pass
     
     # 清空并读回
     kvcache.zero_()
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="r")
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="r")
     while not task.ready():
         pass
     
@@ -221,16 +228,17 @@ def test_large_scale_integrity():
     )
     
     # 写入所有页面
-    tokens = list(range(NUM_PAGES))
+    data = list(range(NUM_PAGES))
+
+    hash_128s = generate_cumulative_hashes(data)
     indexer = torch.arange(NUM_PAGES, dtype=torch.int32)
-    
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="w")
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="w")
     while not task.ready():
         pass
     
     # 清空并读回
     kvcache.zero_()
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="r")
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="r")
     while not task.ready():
         pass
     

@@ -11,6 +11,7 @@ import time
 import torch
 import shutil
 from light_mem import PyLocalCacheService, PyState
+from test_utils import generate_cumulative_hashes
 
 # 配置参数
 PAGE_SIZE = 16384  # 16KB
@@ -102,7 +103,8 @@ def test_mixed_lru_stability():
                 # 从 token 池中选择 (循环重用)
                 token_idx = count % token_pool_size
                 token_val = base_token + token_idx
-                tokens = [token_val]
+                data = [token_val]
+                hash_128s = generate_cumulative_hashes(data)
 
                 # **关键修改**: 让每个 token 对应固定的 page，避免数据竞态
                 # token_idx 0-99 映射到 page 0-99 (确保在 SOURCE 区域内)
@@ -123,7 +125,7 @@ def test_mixed_lru_stability():
                         del token_map[first_key]
 
                 # 提交写任务
-                task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="w")
+                task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="w")
                 while not task.ready():
                     time.sleep(0.001)
 
@@ -185,10 +187,11 @@ def test_mixed_lru_stability():
                     time.sleep(0.1)
                     continue
 
-                tokens = [target_token]
+                data = [target_token]
+                hash_128s = generate_cumulative_hashes(data)
 
                 # 查询是否存在
-                exists = service.query(tokens)
+                exists = service.query(hash_128s)
                 if not exists[0]:
                     with stats_lock:
                         stats["read_miss_early"] += 1
@@ -200,8 +203,7 @@ def test_mixed_lru_stability():
 
                 # 先把 Dest Page 清零，防止残留数据干扰验证
                 kvcache[dest_page_idx].zero_()
-
-                task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="r")
+                task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="r")
 
                 wait_start = time.time()
                 while not task.ready():
@@ -257,7 +259,10 @@ def test_mixed_lru_stability():
 
         # 先写入
         print("[VIP] Writing VIP token...")
-        task = service.create(tokens=[vip_token], kv_page_indexer=torch.tensor([vip_page], dtype=torch.int32), mode="w")
+        vip_data = [vip_token]
+        vip_hash_128s = generate_cumulative_hashes(vip_data)
+
+        task = service.create(hash_128s=vip_hash_128s, kv_page_indexer=torch.tensor([vip_page], dtype=torch.int32), mode="w")
         while not task.ready():
             time.sleep(0.001)
 
@@ -265,7 +270,7 @@ def test_mixed_lru_stability():
         while not stop_event.is_set():
             try:
                 # 频繁 Query
-                exists = service.query([vip_token])
+                exists = service.query(vip_hash_128s)
                 if exists[0]:
                     with stats_lock:
                         stats["vip_survived"] += 1
@@ -274,7 +279,7 @@ def test_mixed_lru_stability():
                         stats["vip_evicted"] += 1
                     # 如果被淘汰了，重新写入，继续测试
                     # print("[VIP] Evicted! Re-writing...")
-                    task = service.create(tokens=[vip_token], kv_page_indexer=torch.tensor([vip_page], dtype=torch.int32), mode="w")
+                    task = service.create(hash_128s=vip_hash_128s, kv_page_indexer=torch.tensor([vip_page], dtype=torch.int32), mode="w")
                     while not task.ready():
                         time.sleep(0.001)
 
