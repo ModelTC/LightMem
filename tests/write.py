@@ -6,6 +6,7 @@ import random
 import time
 import torch
 from light_mem import PyLocalCacheService
+from test_utils import generate_cumulative_hashes
 
 FILE_SIZE = 128 * (1024**3)
 VOCABS = 180000
@@ -38,11 +39,12 @@ print(f"{'Pages':<12} {'Size(GB)':<12} {'Time(ms)':<12} {'BW(GB/s)':<12}")
 print("-" * 60)
 
 for num_of_page in (1, 4, 16, 64, 256, 1024, 4096, 16384, 65536):
-    tokens = [random.randint(0, VOCABS) for _ in range(num_of_page)]
+    data = [random.randint(0, VOCABS) for _ in range(num_of_page)]
+    hash_128s = generate_cumulative_hashes(data)
     indexer = torch.tensor([random.randint(0, NUM_PAGES - 1) for _ in range(num_of_page)], dtype=torch.int32)
 
     start = time.time()
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="w")
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="w")
     while not task.ready():
         pass
     end = time.time()
@@ -57,12 +59,14 @@ print("数据完整性验证...")
 # 验证完整性
 kvcache.copy_(kvcache_backup)
 all_indexer = torch.arange(NUM_PAGES, dtype=torch.int32)
-task = service.create(tokens=list(range(NUM_PAGES)), kv_page_indexer=all_indexer, mode="w")
+data_all = list(range(NUM_PAGES))
+hash_128s_all = generate_cumulative_hashes(data_all)
+task = service.create(hash_128s=hash_128s_all, kv_page_indexer=all_indexer, mode="w")
 while not task.ready():
     pass
 
 kvcache.zero_()
-task = service.create(tokens=list(range(NUM_PAGES)), kv_page_indexer=all_indexer, mode="r")
+task = service.create(hash_128s=hash_128s_all, kv_page_indexer=all_indexer, mode="r")
 while not task.ready():
     pass
 
