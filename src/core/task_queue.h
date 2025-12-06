@@ -34,7 +34,19 @@ public:
   cache::task::CacheBlock *claim() {
     cache::task::CacheBlock *block = nullptr;
     if (blocks_.pop(block)) {
-      block->state = cache::task::State::Working;
+      // Get the task to check if it's been aborted
+      auto task = block->get_task();
+      if (!task) {
+        return nullptr;  // Task destroyed, skip this block
+      }
+      // Check if this block was already aborted before claiming it
+      {
+        std::lock_guard<std::mutex> lock(task->state_mutex);
+        if (block->state == cache::task::State::Aborted) {
+          return nullptr;  // Block was aborted, don't process it
+        }
+        block->state = cache::task::State::Working;
+      }
       return block;
     }
     return nullptr;

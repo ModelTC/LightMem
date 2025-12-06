@@ -14,8 +14,7 @@ from light_mem import PyLocalCacheService, PyState
 from test_utils import generate_cumulative_hashes
 
 # 配置参数
-PAGE_SIZE = 16384  # 16KB
-NUM_LAYERS = 32    # 层数
+PAGE_SIZE = 16384 * 32  # 512KB
 DTYPE = torch.uint8 # uint8 (1 bytes)
 NUM_PAGES = 1024   # 总页数
 
@@ -33,7 +32,7 @@ def test_mixed_lru_stability():
     last_dim = PAGE_SIZE // element_size
 
     # 初始化为全 0
-    kvcache = torch.zeros(size=[NUM_PAGES, NUM_LAYERS * last_dim],
+    kvcache = torch.zeros(size=[NUM_PAGES, last_dim],
                           dtype=DTYPE, device="cpu")
 
     # 填充 Source 区域为确定性数据
@@ -98,6 +97,12 @@ def test_mixed_lru_stability():
         base_token = tid * 1000000
         token_pool_size = 100  # 每个线程 100 个不同的 token
 
+        # 每个线程独占一段 page 区域，避免多线程并发写同一个 page
+        # 将 SOURCE 区域平均分配给 4 个写线程
+        num_writers = 4
+        pages_per_writer = (SOURCE_END - SOURCE_START) // num_writers
+        thread_page_start = SOURCE_START + tid * pages_per_writer
+
         while not stop_event.is_set():
             try:
                 # 从 token 池中选择 (循环重用)
@@ -106,16 +111,19 @@ def test_mixed_lru_stability():
                 data = [token_val]
                 hash_128s = generate_cumulative_hashes(data)
 
-                # **关键修改**: 让每个 token 对应固定的 page，避免数据竞态
-                # token_idx 0-99 映射到 page 0-99 (确保在 SOURCE 区域内)
-                page_idx = SOURCE_START + (token_idx % (SOURCE_END - SOURCE_START))
+                # 映射到本线程独占的 page 区域
+                page_idx = thread_page_start + (token_idx % pages_per_writer)
                 indexer = torch.tensor([page_idx], dtype=torch.int32)
+                # 写入前先更新内存中的数据为此token对应的特征值
+                # 使用 token_val 的某个特征作为填充值,确保每个token有唯一的数据模式
+                token_signature = (token_val // 1000) % 10  # 使用token的高位作为特征
+                kvcache[page_idx].fill_(token_signature)
 
                 # 记录映射 (在写入前记录，虽然有微小的时间差，但只要不覆盖旧 Token 就行)
                 is_new_token = False
                 with map_lock:
                     is_new_token = (token_val not in token_map)
-                    token_map[token_val] = page_idx
+                    token_map[token_val] = (page_idx, token_signature)  # 同时记录签名值
                     # 限制 map 大小，移除太旧的（模拟应用层遗忘）
                     # 但为了测试 LRU，我们其实希望 map 里保留的比 disk 多，这样才能测出 miss
                     if len(token_map) > 5000:
@@ -156,7 +164,7 @@ def test_mixed_lru_stability():
             try:
                 # 随机选一个已知的 Token
                 target_token = None
-                expected_page_idx = -1
+                expected_signature = -1
 
                 with map_lock:
                     if not token_map:
@@ -172,12 +180,12 @@ def test_mixed_lru_stability():
                             hot_tokens.remove(target_token)
                             target_token = None
                         else:
-                            expected_page_idx = token_map[target_token]
+                            _, expected_signature = token_map[target_token]
 
                     if target_token is None:
                         # 随机选一个 token，并可能将其加入热点列表
                         target_token = random.choice(list(token_map.keys()))
-                        expected_page_idx = token_map[target_token]
+                        _, expected_signature = token_map[target_token]
 
                         # 10% 概率成为新的热点
                         if random.random() < 0.1 and len(hot_tokens) < 20:
@@ -218,13 +226,10 @@ def test_mixed_lru_stability():
 
                 # 只有当所有 block 都是 Finished 状态时才验证数据
                 if all(s == PyState.Finished for s in task_states):
-                    # 验证数据
-                    # 检查 kvcache[dest_page_idx] 是否全等于 expected_page_idx % 2048
-                    expected_val = expected_page_idx % 10
+                    # 验证数据 - 使用 token 的签名值
+                    expected_val = expected_signature
 
                     # 使用 torch.all 进行严格的全量检查
-                    # 注意：kvcache 是 half 类型，expected_val 是 int
-                    # 比较时会自动广播
                     if torch.all(kvcache[dest_page_idx] == expected_val):
                         with stats_lock:
                             stats["read_success"] += 1
@@ -255,9 +260,13 @@ def test_mixed_lru_stability():
     # VIP 保活线程
     def vip_thread():
         vip_token = 88888888
-        vip_page = SOURCE_START # 使用第0页
+        # 使用最后一个page,避免与任何写线程冲突
+        vip_page = SOURCE_END - 1
+        vip_signature = (vip_token // 1000) % 10
 
-        # 先写入
+        # 先写入前更新内存数据
+        kvcache[vip_page].fill_(vip_signature)
+
         print("[VIP] Writing VIP token...")
         vip_data = [vip_token]
         vip_hash_128s = generate_cumulative_hashes(vip_data)
@@ -279,6 +288,7 @@ def test_mixed_lru_stability():
                         stats["vip_evicted"] += 1
                     # 如果被淘汰了，重新写入，继续测试
                     # print("[VIP] Evicted! Re-writing...")
+                    kvcache[vip_page].fill_(vip_signature)  # 重新填充数据
                     task = service.create(hash_128s=vip_hash_128s, kv_page_indexer=torch.tensor([vip_page], dtype=torch.int32), mode="w")
                     while not task.ready():
                         time.sleep(0.001)

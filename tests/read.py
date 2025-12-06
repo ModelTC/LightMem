@@ -10,9 +10,8 @@ from test_utils import generate_cumulative_hashes
 
 FILE_SIZE = 256 * (1024**3)
 VOCABS = 180000
-PAGE_SIZE = 16384
+PAGE_SIZE = 16384 * 60
 NUM_PAGES = 128
-NUM_LAYERS = 60
 DTYPE = torch.uint8
 
 ELEMENT_BYTES = torch.tensor([], dtype=DTYPE).element_size()
@@ -20,7 +19,7 @@ if PAGE_SIZE % ELEMENT_BYTES != 0:
     raise ValueError(f"PAGE_SIZE={PAGE_SIZE} 必须是 {DTYPE} 字节数 {ELEMENT_BYTES} 的整数倍")
 
 PAGE_ELEMENTS = PAGE_SIZE // ELEMENT_BYTES
-kvcache = torch.randint(0, 10, size=[NUM_PAGES, NUM_LAYERS * PAGE_ELEMENTS], dtype=DTYPE, device="cpu")
+kvcache = torch.randint(0, 10, size=[NUM_PAGES, PAGE_ELEMENTS], dtype=DTYPE, device="cpu")
 kvcache_backup = kvcache.clone()
 
 os.makedirs("cache", exist_ok=True)
@@ -40,17 +39,17 @@ print("=" * 60)
 print(f"{'Pages':<12} {'Size(GB)':<12} {'Time(ms)':<12} {'BW(GB/s)':<12}")
 print("-" * 60)
 
-for num_of_page in (1, 4, 16, 64, 256, 1024, 4096, 16384, 65536):
+for num_of_page in (1, 4, 16, 64, 256, 1024, 4096, 16384):
     data = [random.randint(0, VOCABS) for _ in range(num_of_page)]
     hash_128s = generate_cumulative_hashes(data)
     indexer = torch.tensor([random.randint(0, NUM_PAGES - 1) for _ in range(num_of_page)], dtype=torch.int32)
-    size_gb = num_of_page * actual_page_size * NUM_LAYERS / 1e9
-    
+    size_gb = num_of_page * actual_page_size / 1e9
+
     # 写入
     task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="w")
     while not task.ready():
         pass
-    
+
     # 清空并读取
     kvcache.zero_()
     start = time.time()

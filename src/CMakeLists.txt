@@ -29,6 +29,15 @@ target_include_directories(${name} PRIVATE .)
 target_compile_definitions(${name} PRIVATE MODULE_NAME=${name})
 target_compile_features(${name} PRIVATE cxx_std_17)
 target_link_libraries(${name} PRIVATE Python::Python Boost::boost ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY})
+
+# Fix for macOS ARM64: use flat namespace to resolve symbols properly
+if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
+  target_link_options(${name} PRIVATE
+    "LINKER:-undefined,dynamic_lookup"
+    "LINKER:-flat_namespace"
+  )
+endif()
+
 set_target_properties(${name} PROPERTIES
   CXX_EXTENSIONS OFF
   PREFIX "")
