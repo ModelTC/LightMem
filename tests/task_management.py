@@ -10,12 +10,11 @@ from test_utils import generate_cumulative_hashes
 
 def test_data_safe_write():
     """测试写模式下的data_safe功能"""
-    PAGE_SIZE = 16384
+    PAGE_SIZE = 16384 * 60
     NUM_PAGES = 128
-    NUM_LAYERS = 60
     DTYPE = torch.uint8
 
-    kvcache = torch.randint(0, 10, size=[NUM_PAGES, NUM_LAYERS * PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()],
+    kvcache = torch.randint(0, 10, size=[NUM_PAGES, PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()],
                          dtype=DTYPE, device="cpu")
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(
@@ -47,12 +46,11 @@ def test_data_safe_write():
 
 def test_data_safe_read():
     """测试读模式下的data_safe功能"""
-    PAGE_SIZE = 16384
+    PAGE_SIZE = 16384 * 60
     NUM_PAGES = 128
-    NUM_LAYERS = 60
     DTYPE = torch.uint8
 
-    kvcache = torch.randint(0, 10, size=[NUM_PAGES, NUM_LAYERS * PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()],
+    kvcache = torch.randint(0, 10, size=[NUM_PAGES, PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()],
                          dtype=DTYPE, device="cpu")
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(
@@ -89,12 +87,11 @@ def test_data_safe_read():
 
 def test_page_already_list():
     """测试page_already_list功能"""
-    PAGE_SIZE = 16384
+    PAGE_SIZE = 16384 * 60
     NUM_PAGES = 128
-    NUM_LAYERS = 60
     DTYPE = torch.uint8
 
-    kvcache = torch.randint(0, 10, size=[NUM_PAGES, NUM_LAYERS * PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()],
+    kvcache = torch.randint(0, 10, size=[NUM_PAGES, PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()],
                          dtype=DTYPE, device="cpu")
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(
@@ -208,12 +205,11 @@ def test_multiple_tasks():
 
 def test_abort_task():
     """测试任务中止"""
-    PAGE_SIZE = 16384
+    PAGE_SIZE = 16384 * 60
     NUM_PAGES = 256
-    NUM_LAYERS = 60
     DTYPE = torch.uint8
 
-    kvcache = torch.randint(0, 10, size=[NUM_PAGES, NUM_LAYERS * PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()],
+    kvcache = torch.randint(0, 10, size=[NUM_PAGES, PAGE_SIZE // torch.tensor([], dtype=DTYPE).element_size()],
                          dtype=DTYPE, device="cpu")
     os.makedirs("cache", exist_ok=True)
     service = PyLocalCacheService(
