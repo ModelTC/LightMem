@@ -4,6 +4,7 @@
 import os
 import torch
 from light_mem import PyLocalCacheService, PyState
+from test_utils import generate_cumulative_hashes
 
 FILE_SIZE = 32 * (1024**3)
 PAGE_SIZE = 64 * 60
@@ -30,10 +31,11 @@ print("=" * 60)
 print("任务中止测试")
 print("=" * 60)
 
-tokens = list(range(NUM_PAGES))
+data = list(range(NUM_PAGES))
+hash_128s = generate_cumulative_hashes(data)
 indexer = torch.tensor(list(range(NUM_PAGES)), dtype=torch.int32)
 
-task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="w")
+task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="w")
 service.abort(task)
 
 if not task.ready():

@@ -5,6 +5,7 @@ import os
 import random
 import torch
 from light_mem import PyLocalCacheService
+from test_utils import generate_cumulative_hashes
 
 def test_query_existing():
     """测试查询已存在的数据"""
@@ -19,20 +20,21 @@ def test_query_existing():
     )
 
     # 写入数据
-    tokens = list(range(50))
+    data = list(range(50))
+    hash_128s = generate_cumulative_hashes(data)
     indexer = torch.arange(50, dtype=torch.int32)
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="w")
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="w")
     while not task.ready():
         pass
 
     # 查询刚写入的数据
-    result = service.query(tokens)
+    result = service.query(hash_128s)
 
     if not isinstance(result, list):
         print("✗ 查询结果类型错误")
         return False
 
-    if len(result) != len(service.hash(tokens)):
+    if len(result) != len(service._hash(hash_128s)):
         print("✗ 查询结果长度不匹配")
         return False
 
@@ -58,8 +60,9 @@ def test_query_non_existing():
     )
 
     # 查询未写入的随机数据
-    tokens = [random.randint(1000000, 2000000) for _ in range(100)]
-    result = service.query(tokens)
+    data = [random.randint(1000000, 2000000) for _ in range(100)]
+    hash_128s = generate_cumulative_hashes(data)
+    result = service.query(hash_128s)
 
     miss_count = sum(1 for r in result if not r)
     print(f"✓ 查询不存在数据: {miss_count}/{len(result)} 未命中")
@@ -78,15 +81,17 @@ def test_query_partial_hit():
     )
 
     # 写入部分数据
-    write_tokens = list(range(30))
+    write_data = list(range(30))
+    write_hash_128s = generate_cumulative_hashes(write_data)
     indexer = torch.arange(30, dtype=torch.int32)
-    task = service.create(tokens=write_tokens, kv_page_indexer=indexer, mode="w")
+    task = service.create(hash_128s=write_hash_128s, kv_page_indexer=indexer, mode="w")
     while not task.ready():
         pass
 
     # 查询包含已写入和未写入的数据
-    query_tokens = list(range(60))  # 前30个存在，后30个不存在
-    result = service.query(query_tokens)
+    query_data = list(range(60))  # 前30个存在，后30个不存在
+    query_hash_128s = generate_cumulative_hashes(query_data)
+    result = service.query(query_hash_128s)
 
     hit_count = sum(1 for r in result if r)
     print(f"✓ 部分命中查询: {hit_count}/{len(result)} 命中")
@@ -126,15 +131,17 @@ def test_query_large_batch():
     )
 
     # 写入一些数据
-    write_tokens = list(range(50))
+    write_data = list(range(50))
+    write_hash_128s = generate_cumulative_hashes(write_data)
     indexer = torch.arange(50, dtype=torch.int32)
-    task = service.create(tokens=write_tokens, kv_page_indexer=indexer, mode="w")
+    task = service.create(hash_128s=write_hash_128s, kv_page_indexer=indexer, mode="w")
     while not task.ready():
         pass
 
     # 大批量查询
-    large_tokens = list(range(10000))
-    result = service.query(large_tokens)
+    large_data = list(range(10000))
+    large_hash_128s = generate_cumulative_hashes(large_data)
+    result = service.query(large_hash_128s)
 
     hit_count = sum(1 for r in result if r)
     print(f"✓ 大批量查询: {len(result)} 个查询, {hit_count} 命中")
@@ -152,16 +159,17 @@ def test_query_repeated():
         num_worker=4,
     )
 
-    tokens = list(range(30))
+    data = list(range(30))
+    hash_128s = generate_cumulative_hashes(data)
     indexer = torch.arange(30, dtype=torch.int32)
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="w")
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="w")
     while not task.ready():
         pass
 
-    # 多次查询相同的tokens
-    result1 = service.query(tokens)
-    result2 = service.query(tokens)
-    result3 = service.query(tokens)
+    # 多次查询相同的hash_128s
+    result1 = service.query(hash_128s)
+    result2 = service.query(hash_128s)
+    result3 = service.query(hash_128s)
 
     if result1 == result2 == result3:
         print("✓ 重复查询结果一致")

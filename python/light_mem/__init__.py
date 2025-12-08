@@ -1,10 +1,6 @@
 from enum import Enum
-from math import ceil
 from typing import List
-
-import numpy as np
 import torch
-import xxhash
 
 from . import light_mem
 
@@ -105,39 +101,43 @@ class PyLocalCacheService:
         self._page_size: int = int(self._c.page_size())
         self._n: int = self._block_size // self._page_size
 
-    def hash(self, tokens: List[int]) -> List[str]:
-        """将 tokens 数组按照长度 n 进行划分，并计算哈希值。
+    def _hash(self, hash_128s: List[int]) -> List[str]:
+        """将 128 位哈希整数数组按照长度 n 进行划分，并生成块哈希。
 
-        每个分块都会独立计算一次 xxhash.xxh3_128，避免跨分块的前缀依赖，
-        从而保证同一段内容在任意组合顺序下得到的哈希值保持一致。
+        由于输入是累计哈希（每个哈希已包含之前所有数据的信息），
+        直接使用每个块的最后一个哈希值作为该块的标识即可。
 
-        :param tokens: 整数列表，表示需要哈希的 token 序列。
-        :return: 每个分块的哈希值列表。
+        :param hash_128s: 128 位累计哈希整数列表。
+        :return: 每个分块的哈希值列表（32位十六进制字符串）。
         """
-        if not tokens:
+        if not hash_128s:
             return []
-        tokens_np = np.array(tokens, dtype=np.uint64)
-        num_full = len(tokens_np) // self._n
-        # 处理完整块
-        result = [xxhash.xxh3_128(chunk.tobytes()).hexdigest()
-                  for chunk in tokens_np[:num_full * self._n].reshape(num_full, self._n)] if num_full > 0 else []
-        # 处理剩余块
-        if len(tokens_np) % self._n:
-            result.append(xxhash.xxh3_128(tokens_np[num_full * self._n:].tobytes()).hexdigest())
+
+        n = self._n
+        num_full = len(hash_128s) // n
+
+        # 处理完整块 - 取每个块的最后一个哈希值
+        result = [format(hash_128s[(i+1)*n - 1], '032x')
+                  for i in range(num_full)]
+
+        # 处理剩余块 - 取剩余部分的最后一个哈希值
+        if len(hash_128s) % n:
+            result.append(format(hash_128s[-1], '032x'))
+
         return result
 
     def create(
-        self, tokens: List[int], kv_page_indexer: torch.Tensor, mode: str, start_pos: int = 0
+        self, hash_128s: List[int], kv_page_indexer: torch.Tensor, mode: str, start_pos: int = 0
     ) -> PyTask:
         """ 创建并立即提交一个异步存取任务
 
         Args:
-            tokens (List[int]): 用户传入的 token list
-                (实际执行的存取请求面向 tokens[start_pos: ])
-                但用户不能够直接传入截断后的 tokens，因为需要 tokens 前面的内容计算哈希
+            hash_128s (List[int]): 用户传入的 128 位哈希整数列表
+                (实际执行的存取请求面向 hash_128s[start_pos: ])
+                但用户不能够直接传入截断后的 hash_128s，因为需要 hash_128s 前面的内容计算哈希
             start_pos (int): 任务开始位置
             kv_page_indexer (torch.Tensor):
-                一个索引数组，用来表示 tokens 对应的 kvcache_tensor 位置，必须是一维的
+                一个索引数组，用来表示 hash_128s 对应的 kvcache_tensor 位置，必须是一维的
             mode (str): r: 异步读取 | w: 异步写入
 
         Returns:
@@ -147,16 +147,16 @@ class PyLocalCacheService:
         # 我们需要根据 start pos, end pos 来确定究竟多少个 block 需要被提交
         # 并且针对真实提交的任务，确定其对应的 kv_page_indexer
         start_block_idx: int = start_pos // self._n
-        hashs = self.hash(tokens=tokens)
+        hashs = self._hash(hash_128s=hash_128s)
         hashs = hashs[start_block_idx: ]
         _kv_page_indexer = kv_page_indexer[start_block_idx * self._n: ]
 
         task = self._c.create(hashs, _kv_page_indexer, mode)
         return PyTask(task)
 
-    def query(self, tokens: List[int]) -> List[bool]:
+    def query(self, hash_128s: List[int]) -> List[bool]:
         """ 查询给定的哈希是否存在(以hash列表形式一次查询多个) """
-        hashs = self.hash(tokens=tokens)
+        hashs = self._hash(hash_128s=hash_128s)
         return self._c.query(hashs)
 
     def active_threads(self, mode: str) -> int:

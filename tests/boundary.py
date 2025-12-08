@@ -4,6 +4,7 @@
 import os
 import torch
 from light_mem import PyLocalCacheService, PyState
+from test_utils import generate_cumulative_hashes
 
 def test_single_page():
     """测试单页操作"""
@@ -18,15 +19,16 @@ def test_single_page():
         num_worker=2,
     )
 
-    tokens = [1]
+    data = [1]
+    hash_128s = generate_cumulative_hashes(data)
     indexer = torch.tensor([0], dtype=torch.int32)
 
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="w")
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="w")
     while not task.ready():
         pass
 
     kvcache.zero_()
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="r")
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="r")
     while not task.ready():
         pass
 
@@ -50,10 +52,11 @@ def test_zero_start_pos():
         num_worker=2,
     )
 
-    tokens = list(range(20))
+    data = list(range(20))
+    hash_128s = generate_cumulative_hashes(data)
     indexer = torch.arange(20, dtype=torch.int32)
 
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="w", start_pos=0)
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="w", start_pos=0)
     while not task.ready():
         pass
 
@@ -63,7 +66,7 @@ def test_zero_start_pos():
 
     # 验证数据
     kvcache.zero_()
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="r", start_pos=0)
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="r", start_pos=0)
     while not task.ready():
         pass
 
@@ -97,7 +100,9 @@ def test_non_zero_start_pos():
     # 代码内部会根据 start_block_idx * n 来截取
     n = service._n
     total_tokens = n * 5  # 5个块
-    tokens = list(range(total_tokens))
+    data = list(range(total_tokens))
+
+    hash_128s = generate_cumulative_hashes(data)
 
     # indexer 必须包含所有 tokens 的页索引（完整的）
     # 代码会根据 start_pos 自动截取: indexer[start_block_idx * n:]
@@ -106,7 +111,7 @@ def test_non_zero_start_pos():
     # 从第 2 个块开始处理（start_pos = n * 2）
     start_pos = n * 2
 
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="w", start_pos=start_pos)
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="w", start_pos=start_pos)
     while not task.ready():
         pass
 
@@ -117,7 +122,7 @@ def test_non_zero_start_pos():
     # 验证数据：只有从 start_pos 开始的数据被写入
     # 读取回来验证
     kvcache.zero_()
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="r", start_pos=start_pos)
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="r", start_pos=start_pos)
     while not task.ready():
         pass
 
@@ -162,10 +167,12 @@ def test_boundary_page_index():
     )
 
     # 测试第一个和最后一个页面
-    tokens = [1, 2]
+    data = [1, 2]
+
+    hash_128s = generate_cumulative_hashes(data)
     indexer = torch.tensor([0, NUM_PAGES - 1], dtype=torch.int32)
 
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="w")
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="w")
     while not task.ready():
         pass
 
@@ -175,7 +182,7 @@ def test_boundary_page_index():
 
     # 验证数据
     kvcache.zero_()
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="r")
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="r")
     while not task.ready():
         pass
 
@@ -205,11 +212,12 @@ def test_all_same_page():
     # 为了验证，我们让每次写入的数据不同，但这里 kvcache 是静态的
     # 所以我们只验证写入成功，并且读回的数据与原始数据一致
 
-    tokens = list(range(10))
+    data = list(range(10))
+    hash_128s = generate_cumulative_hashes(data)
     target_page = 5
     indexer = torch.tensor([target_page] * 10, dtype=torch.int32)
 
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="w")
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="w")
     while not task.ready():
         pass
 
@@ -220,7 +228,7 @@ def test_all_same_page():
     # 验证数据
     kvcache.zero_()
     # 读取时必须使用与写入时相同的 tokens，以保证 hash 一致
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="r")
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="r")
     while not task.ready():
         pass
 
@@ -244,15 +252,16 @@ def test_sequential_pages():
         num_worker=4,
     )
 
-    tokens = list(range(50))
+    data = list(range(50))
+    hash_128s = generate_cumulative_hashes(data)
     indexer = torch.arange(50, dtype=torch.int32)
 
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="w")
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="w")
     while not task.ready():
         pass
 
     kvcache.zero_()
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="r")
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="r")
     while not task.ready():
         pass
 
@@ -279,10 +288,11 @@ def test_max_pages():
         num_worker=8,
     )
 
-    tokens = list(range(NUM_PAGES))
+    data = list(range(NUM_PAGES))
+    hash_128s = generate_cumulative_hashes(data)
     indexer = torch.arange(NUM_PAGES, dtype=torch.int32)
 
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="w")
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="w")
     while not task.ready():
         pass
 
@@ -293,7 +303,7 @@ def test_max_pages():
 
     # 验证数据
     kvcache.zero_()
-    task = service.create(tokens=tokens, kv_page_indexer=indexer, mode="r")
+    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="r")
     while not task.ready():
         pass
 
