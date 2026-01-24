@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -60,8 +61,7 @@ struct alignas(8) CacheParam_t {
   CacheParam_t() : base_ptr(nullptr), page_size(0), page_stride(0), num_of_page(0) {}
 
   CacheParam_t(char *ptr, int64_t page_size, int64_t page_strd, int64_t pages)
-      : base_ptr(ptr), page_size(page_size), page_stride(page_strd),
-        num_of_page(pages) {}
+      : base_ptr(ptr), page_size(page_size), page_stride(page_strd), num_of_page(pages) {}
 };
 
 // Generic Cache Service Base Class
@@ -109,8 +109,7 @@ public:
     page_stride = strides[0] * element_size;
 
     const int64_t inferred_page_size = sizes[1] * element_size;
-    cache_info_ =
-        CacheParam_t((char *)kvcache.data_ptr(), inferred_page_size, page_stride, num_pages);
+    cache_info_ = CacheParam_t((char *)kvcache.data_ptr(), inferred_page_size, page_stride, num_pages);
 
     const int64_t page_bytes = cache_info_.page_size;
     const int64_t block_limit = resolve_max_block_size_bytes();
@@ -122,12 +121,13 @@ public:
     }
     block_size_ = page_bytes * pages_per_block;
 
-    printf("CacheService created with following cache info: \n");
-    printf("\tNum of page: %lld \n", static_cast<long long>(cache_info_.num_of_page));
-    printf("\tPage Size: %lld \n", static_cast<long long>(cache_info_.page_size));
-    printf("\tPage Stride: %lld \n", static_cast<long long>(cache_info_.page_stride));
-    printf("\tPages Per Block: %lld \n", static_cast<long long>(pages_per_block));
-    printf("\tBlock Size: %lld \n", static_cast<long long>(block_size_));
+    std::fprintf(stderr, "[light_mem] CacheService created with following cache info:\n");
+    std::fprintf(stderr, "\tNum of page: %lld\n", static_cast<long long>(cache_info_.num_of_page));
+    std::fprintf(stderr, "\tPage Size: %lld\n", static_cast<long long>(cache_info_.page_size));
+    std::fprintf(stderr, "\tPage Stride: %lld\n", static_cast<long long>(cache_info_.page_stride));
+    std::fprintf(stderr, "\tPages Per Block: %lld\n", static_cast<long long>(pages_per_block));
+    std::fprintf(stderr, "\tBlock Size: %lld\n", static_cast<long long>(block_size_));
+    std::fflush(stderr);
   }
 
   /**
@@ -138,6 +138,11 @@ public:
    * This function will throw no exception or error.
    */
   virtual std::vector<bool> query(const std::vector<std::string> &hashs) = 0;
+
+  // Whether this service instance is running in online/distributed mode.
+  // In online mode shard ownership can be dynamic and certain optimizations (e.g. pre-query on write)
+  // must be disabled.
+  virtual bool online_mode() const { return false; }
 
   int64_t block_size() const;
   int64_t page_size() const;
@@ -203,17 +208,24 @@ public:
 
     // For write mode, query which pages are already in disk cache
     if (mode == "w") {
-      std::vector<bool> query_result = query(hashs);
-      const int32_t *page_ptr = reinterpret_cast<int32_t *>(kv_page_indexer.data_ptr());
+      // NOTE:
+      // - In single-node mode this pre-query is cheap (O(1) shard lookup) and saves writes.
+      // - In online/distributed mode, shard ownership can be dynamic and pre-query tends to be expensive
+      //   (e.g., scanning all shards and/or Redis RTT per hash), which can dominate write throughput.
+      //   Dedupe/consistency is already enforced by the write path (WAL/Redis), so we skip this step.
+      if (!online_mode()) {
+        std::vector<bool> query_result = query(hashs);
+        const int32_t *page_ptr = reinterpret_cast<int32_t *>(kv_page_indexer.data_ptr());
 
-      for (int64_t block_idx = 0; block_idx < static_cast<int64_t>(hashs.size()); ++block_idx) {
-        if (query_result[block_idx]) {
-          // This block is already in disk cache, add its page indices to page_already_list
-          const int64_t start_page_in_block = block_idx * page_per_block;
-          const int64_t end_page_in_block = std::min(start_page_in_block + page_per_block, num_of_pages);
+        for (int64_t block_idx = 0; block_idx < static_cast<int64_t>(hashs.size()); ++block_idx) {
+          if (query_result[block_idx]) {
+            // This block is already in disk cache, add its page indices to page_already_list
+            const int64_t start_page_in_block = block_idx * page_per_block;
+            const int64_t end_page_in_block = std::min(start_page_in_block + page_per_block, num_of_pages);
 
-          for (int64_t page_idx = start_page_in_block; page_idx < end_page_in_block; ++page_idx) {
-            task->page_already_list.push_back(page_ptr[page_idx]);
+            for (int64_t page_idx = start_page_in_block; page_idx < end_page_in_block; ++page_idx) {
+              task->page_already_list.push_back(page_ptr[page_idx]);
+            }
           }
         }
       }
@@ -348,6 +360,13 @@ inline int64_t CacheService::active_create_count(const std::string &mode) const 
 inline void CacheService::finalize_task(const std::shared_ptr<cache::task::CacheTask> &task) {
   if (!task->mark_completion_notified()) {
     return;
+  }
+
+  // Record finish timestamp for end-to-end latency metrics.
+  {
+    const auto now_duration = std::chrono::steady_clock::now().time_since_epoch();
+    const int64_t now_ticks = static_cast<int64_t>(now_duration.count());
+    task->finish_time_ticks.store(now_ticks, std::memory_order_relaxed);
   }
 
   std::atomic<int64_t> *active_counter =

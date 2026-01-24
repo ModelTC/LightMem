@@ -29,6 +29,7 @@ service = PyLocalCacheService(
     storage_size=FILE_SIZE,
     num_shard=32,
     num_worker=32,
+    bandwidth_log=False,
 )
 
 actual_page_size = service._page_size

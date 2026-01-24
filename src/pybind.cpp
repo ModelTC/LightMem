@@ -31,11 +31,21 @@ PYBIND11_MODULE(MODULE_NAME, m) {
       .def("get_page_already_list", &CacheTask::get_page_already_list, "Get list of page indices already on disk");
 
   py::class_<LocalCacheService>(m, "LocalCacheService")
-      .def(py::init<const std::string &, std::size_t, std::size_t, const torch::Tensor &, std::size_t>(),
+      .def(py::init<const std::string &, std::size_t, std::size_t, const torch::Tensor &, std::size_t,
+                    const std::string &, bool, const std::string &>(),
            py::arg("file"), py::arg("storage_size"), py::arg("num_of_shard"), py::arg("kvcache"),
-           py::arg("num_workers"))
+           py::arg("num_workers"), py::arg("index_endpoint") = std::string(), py::arg("bandwidth_log") = true,
+           py::arg("index_prefix") = std::string())
       .def("run", &LocalCacheService::run)
       .def("query", &LocalCacheService::query)
+      .def("update_shard_assignments", &LocalCacheService::update_shard_assignments, py::arg("shard_ids"),
+           py::arg("epochs"), py::arg("draining"))
+      .def("recover_shard_to_redis", &LocalCacheService::recover_shard_to_redis, py::arg("shard_id"))
+      .def("recover_shard_to_redis_smart", &LocalCacheService::recover_shard_to_redis_smart, py::arg("shard_id"))
+      .def("shard_inflight", &LocalCacheService::shard_inflight, py::arg("shard_id"))
+      .def("shard_eviction_count", &LocalCacheService::shard_eviction_count, py::arg("shard_id"))
+      .def("eviction_count", &LocalCacheService::eviction_count)
+      .def("eviction_observed", &LocalCacheService::eviction_observed)
       .def("abort", &LocalCacheService::abort_task)
       .def("create", &LocalCacheService::create)
       .def("active_create_count", &LocalCacheService::active_create_count, py::arg("mode"))

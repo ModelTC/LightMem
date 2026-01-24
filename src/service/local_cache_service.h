@@ -11,7 +11,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -45,11 +48,10 @@ public:
    * @param num_workers Number of worker threads
    */
   LocalCacheService(const string &file, size_t storage_size, size_t num_shard, const torch::Tensor &kvcache,
-                    const size_t num_workers)
-      : CacheService(kvcache), stop_(false), num_workers_(num_workers), block_size_(0), total_written_bytes_(0),
-        first_write_time_ticks_(0), last_write_time_ticks_(0), last_log_time_(), last_logged_bytes_(0),
-        total_read_bytes_(0), first_read_time_ticks_(0), last_read_time_ticks_(0), read_last_log_time_(),
-        read_last_logged_bytes_(0) {
+                    const size_t num_workers, const std::string &index_endpoint = "", bool bandwidth_log = true,
+                    const std::string &index_prefix = "")
+      : CacheService(kvcache), stop_(false), num_workers_(num_workers), block_size_(0), bandwidth_log_(bandwidth_log),
+        online_mode_(!index_endpoint.empty()) {
     block_size_ = static_cast<size_t>(this->block_size());
 
     if (storage_size < block_size_) {
@@ -58,7 +60,7 @@ public:
 
     ensure_disk_capacity(file, storage_size, num_shard);
 
-    storage_ = make_unique<LocalStorageEngine>(file, storage_size, num_shard, block_size_);
+    storage_ = make_unique<LocalStorageEngine>(file, storage_size, num_shard, block_size_, index_endpoint, index_prefix);
 
     // Use unique_ptr for exception safety - if any allocation fails, previous allocations are automatically cleaned up
     r_cpu_buffers_.reserve(num_workers_);
@@ -90,11 +92,97 @@ public:
    * This function will throw no exception or error.
    */
   std::vector<bool> query(const std::vector<std::string> &hashs) override {
-    std::vector<bool> ret;
-    ret.reserve(hashs.size());
-    std::transform(hashs.begin(), hashs.end(), std::back_inserter(ret),
-                   [this](const auto &hash) { return storage_->query(hash); });
-    return ret;
+    if (!storage_) {
+      return std::vector<bool>(hashs.size(), false);
+    }
+    return storage_->queryMany(hashs);
+  }
+
+  // Online/distributed mode hooks (optionally driven by a Python coordinator).
+  // These APIs are control-plane helpers for shard ownership handoff.
+  // Notes:
+  // - "writable" controls whether new writes are allowed for a shard.
+  // - "draining" is a transition state: shard is still considered owned/readable, but new writes are rejected.
+  // - "epoch" is a generation number used to fence writes across ownership changes.
+
+  /**
+   * @brief Update this node's shard assignment state in online/distributed mode.
+   *
+   * @param shard_ids Shard IDs owned/managed by this node.
+   * @param epochs    Per-shard epoch (generation). Must align 1:1 with shard_ids.
+   * @param draining  Per-shard draining flag (0/1). If 1, shard is treated as not writable (no new writes).
+   *
+   * Requirements: shard_ids/epochs/draining must have the same length.
+   */
+  void update_shard_assignments(const std::vector<size_t> &shard_ids, const std::vector<uint64_t> &epochs,
+                                const std::vector<uint8_t> &draining) {
+    if (!storage_) {
+      return;
+    }
+    storage_->updateShardAssignments(shard_ids, epochs, draining);
+  }
+
+  /**
+   * @brief Rebuild Redis index for a shard from local snapshot + WAL.
+   *
+   * Intended to be called when a node (re-)acquires write permission for a shard.
+   */
+  void recover_shard_to_redis(size_t shard_id) {
+    if (!storage_) {
+      return;
+    }
+    storage_->recoverShardToRedis(shard_id);
+  }
+
+  /**
+   * @brief Recover Redis index for a shard using smart policy (full vs incremental).
+   */
+  void recover_shard_to_redis_smart(size_t shard_id) {
+    if (!storage_) {
+      return;
+    }
+    storage_->recoverShardToRedisSmart(shard_id);
+  }
+
+  /**
+   * @brief Observability: current in-flight write operations for a shard.
+   *
+   * This is a best-effort counter used by the coordinator/control-plane to decide when a shard is drained.
+   */
+  uint32_t shard_inflight(size_t shard_id) const {
+    if (!storage_) {
+      return 0;
+    }
+    return storage_->shardInflight(shard_id);
+  }
+
+  uint64_t shard_written_bytes(size_t shard_id) const {
+    if (!storage_) {
+      return 0;
+    }
+    return storage_->shardWrittenBytes(shard_id);
+  }
+
+  // True LRU eviction observability (local to this node).
+  uint64_t shard_eviction_count(size_t shard_id) const {
+    if (!storage_) {
+      return 0;
+    }
+    return storage_->shardEvictionCount(shard_id);
+  }
+
+  uint64_t eviction_count() const {
+    if (!storage_) {
+      return 0;
+    }
+    return storage_->evictionCount();
+  }
+
+  bool eviction_observed() const {
+    if (!storage_) {
+      return false;
+    }
+    return storage_->evictionObserved();
   }
 
   /**
@@ -108,8 +196,29 @@ public:
   }
 
 protected:
+  bool online_mode() const override { return online_mode_; }
+
   void on_task_finalized(const std::shared_ptr<cache::task::CacheTask> &task) override {
+    if (!bandwidth_log_) {
+      return;
+    }
+
     if (task->operation_mode == cache::task::Mode::Write) {
+      // Keep log format identical to historical output, but compute recent write speed
+      // with end-to-end task timing to match benchmark scripts more closely.
+      // - bytes (for speed) = pages * page_size (logical/requested bytes)
+      // - time  (for speed) = create() -> ready() end-to-end (per task)
+      const int64_t start_ticks = task->submit_time_ticks.load(std::memory_order_relaxed);
+      const int64_t end_ticks = task->finish_time_ticks.load(std::memory_order_relaxed);
+      if (start_ticks != 0 && end_ticks != 0 && end_ticks > start_ticks) {
+        const int64_t pages = task->page_indexer.numel();
+        const uint64_t logical_bytes =
+            static_cast<uint64_t>(pages) * static_cast<uint64_t>(this->page_size());
+        const int64_t elapsed_ticks = end_ticks - start_ticks;
+        window_logical_written_bytes_.fetch_add(logical_bytes, std::memory_order_relaxed);
+        window_logical_write_time_ticks_.fetch_add(elapsed_ticks, std::memory_order_relaxed);
+      }
+
       // Try to acquire the lock, skip logging if contention occurs
       std::unique_lock<std::mutex> guard(log_mutex_, std::try_to_lock);
       if (!guard.owns_lock()) {
@@ -133,22 +242,23 @@ protected:
       const uint64_t delta_bytes = (total >= previous_bytes) ? (total - previous_bytes) : 0;
       double speed_gbps = 0.0;
 
-      // Use actual I/O time for speed calculation
-      if (last_log_time_ != std::chrono::steady_clock::time_point{}) {
-        const double elapsed_sec =
-            std::chrono::duration_cast<std::chrono::duration<double>>(now - last_log_time_).count();
-        if (elapsed_sec > 0.0) {
-          speed_gbps = (static_cast<double>(delta_bytes) / (1024.0 * 1024.0 * 1024.0)) / elapsed_sec;
+      // Prefer end-to-end (script-like) accounting for speed.
+      const uint64_t window_bytes = window_logical_written_bytes_.exchange(0, std::memory_order_relaxed);
+      const int64_t window_ticks = window_logical_write_time_ticks_.exchange(0, std::memory_order_relaxed);
+      if (window_bytes != 0 && window_ticks > 0) {
+        const auto window_dur =
+            std::chrono::steady_clock::duration(static_cast<std::chrono::steady_clock::duration::rep>(window_ticks));
+        const double window_sec = std::chrono::duration_cast<std::chrono::duration<double>>(window_dur).count();
+        if (window_sec > 0.0) {
+          speed_gbps = (static_cast<double>(window_bytes) / (1024.0 * 1024.0 * 1024.0)) / window_sec;
         }
-      } else {
-        // For the first log, use time from first write start to now
-        const int64_t first_ticks = first_write_time_ticks_.load(std::memory_order_relaxed);
-        if (first_ticks != 0) {
-          const auto first_duration =
-              std::chrono::steady_clock::duration(static_cast<std::chrono::steady_clock::duration::rep>(first_ticks));
-          const auto first_time = std::chrono::steady_clock::time_point(first_duration);
+      }
+
+      // Fallback: if window accounting isn't available, keep legacy behavior.
+      if (speed_gbps == 0.0) {
+        if (last_log_time_ != std::chrono::steady_clock::time_point{}) {
           const double elapsed_sec =
-              std::chrono::duration_cast<std::chrono::duration<double>>(now - first_time).count();
+              std::chrono::duration_cast<std::chrono::duration<double>>(now - last_log_time_).count();
           if (elapsed_sec > 0.0) {
             speed_gbps = (static_cast<double>(delta_bytes) / (1024.0 * 1024.0 * 1024.0)) / elapsed_sec;
           }
@@ -159,63 +269,57 @@ protected:
       last_logged_bytes_ = total;
 
       const double total_gb = static_cast<double>(total) / (1024.0 * 1024.0 * 1024.0);
-      printf("[light_mem] cumulative disk write size: %.2f GB, recent write speed: %.2f GB/s\n", total_gb, speed_gbps);
+      std::fprintf(stderr, "[light_mem] cumulative disk write size: %.2f GB, recent write speed: %.2f GB/s\n",
+                   total_gb, speed_gbps);
+      std::fflush(stderr);
       return;
     }
 
     if (task->operation_mode != cache::task::Mode::Read) {
       return;
     }
+
+    // For read mode, align bandwidth accounting with benchmark scripts:
+    // - bytes (for speed) = pages * page_size (logical/requested bytes)
+    // - time  (for speed) = create() -> ready() end-to-end (per task)
+    const int64_t start_ticks = task->submit_time_ticks.load(std::memory_order_relaxed);
+    const int64_t end_ticks = task->finish_time_ticks.load(std::memory_order_relaxed);
+    if (start_ticks != 0 && end_ticks != 0 && end_ticks > start_ticks) {
+      const int64_t pages = task->page_indexer.numel();
+      const uint64_t logical_bytes =
+          static_cast<uint64_t>(pages) * static_cast<uint64_t>(this->page_size());
+      const int64_t elapsed_ticks = end_ticks - start_ticks;
+      window_logical_read_bytes_.fetch_add(logical_bytes, std::memory_order_relaxed);
+      window_logical_read_time_ticks_.fetch_add(elapsed_ticks, std::memory_order_relaxed);
+    }
+
     if (active_read_creates_.load(std::memory_order_relaxed) != 0) {
       return;
     }
 
     std::lock_guard<std::mutex> guard(read_log_mutex_);
 
-    const uint64_t total_read = total_read_bytes_.load(std::memory_order_relaxed);
-    if (total_read == 0) {
+    const uint64_t window_bytes = window_logical_read_bytes_.exchange(0, std::memory_order_relaxed);
+    const int64_t window_ticks = window_logical_read_time_ticks_.exchange(0, std::memory_order_relaxed);
+    if (window_bytes == 0 || window_ticks <= 0) {
       return;
     }
 
-    // Calculate batch read amount (since last queue empty)
-    const uint64_t previous_read = read_last_logged_bytes_;
-    const uint64_t delta_read = (total_read >= previous_read) ? (total_read - previous_read) : 0;
-    if (delta_read == 0) {
+    const auto window_dur =
+        std::chrono::steady_clock::duration(static_cast<std::chrono::steady_clock::duration::rep>(window_ticks));
+    const double window_sec = std::chrono::duration_cast<std::chrono::duration<double>>(window_dur).count();
+    if (window_sec <= 0.0) {
       return;
     }
 
-    // Use actual I/O time: from first read start to last read completion
-    const int64_t first_ticks = first_read_time_ticks_.load(std::memory_order_relaxed);
-    const int64_t last_ticks = last_read_time_ticks_.load(std::memory_order_relaxed);
-
-    double speed_gbps = 0.0;
-    if (first_ticks != 0 && last_ticks != 0 && last_ticks > first_ticks) {
-      const auto first_duration =
-          std::chrono::steady_clock::duration(static_cast<std::chrono::steady_clock::duration::rep>(first_ticks));
-      const auto last_duration =
-          std::chrono::steady_clock::duration(static_cast<std::chrono::steady_clock::duration::rep>(last_ticks));
-      const auto first_time = std::chrono::steady_clock::time_point(first_duration);
-      const auto last_time = std::chrono::steady_clock::time_point(last_duration);
-      const double elapsed_sec =
-          std::chrono::duration_cast<std::chrono::duration<double>>(last_time - first_time).count();
-      if (elapsed_sec > 0.0) {
-        speed_gbps = (static_cast<double>(delta_read) / (1024.0 * 1024.0 * 1024.0)) / elapsed_sec;
-      }
-    }
-
+    const double window_gb = static_cast<double>(window_bytes) / (1024.0 * 1024.0 * 1024.0);
+    const double speed_gbps = window_gb / window_sec;
     if (speed_gbps <= 0.0) {
       return;
     }
 
-    const double delta_read_gb = static_cast<double>(delta_read) / (1024.0 * 1024.0 * 1024.0);
-
-    // Reset counters for next batch after queue is empty
-    read_last_log_time_ = std::chrono::steady_clock::now();
-    read_last_logged_bytes_ = 0;                                // Reset to 0 instead of total_read
-    total_read_bytes_.store(0, std::memory_order_relaxed);      // Clear accumulated bytes
-    first_read_time_ticks_.store(0, std::memory_order_relaxed); // Reset timing
-    last_read_time_ticks_.store(0, std::memory_order_relaxed);  // Reset timing
-    printf("[light_mem] batch read size: %.2f GB, read speed: %.2f GB/s\n", delta_read_gb, speed_gbps);
+    std::fprintf(stderr, "[light_mem] batch read size: %.2f GB, read speed: %.2f GB/s\n", window_gb, speed_gbps);
+    std::fflush(stderr);
   }
 
 private:
@@ -356,6 +460,7 @@ private:
     // 2. Temporary failure (all slots busy, I/O error)
     // 3. Write was skipped
     // This is acceptable for cache operations - treat as success to avoid abort
+
     if (written == block_size_) {
       total_written_bytes_.fetch_add(static_cast<uint64_t>(written), std::memory_order_relaxed);
     }
@@ -387,6 +492,33 @@ private:
     const int64_t page_stride = info.page_stride;
     const int64_t total_pages = info.num_of_page;
     const int64_t page_bytes = page_size;
+
+    // Fast path: if destination pages are contiguous in memory and indices form a contiguous range,
+    // we can copy the entire span in one memcpy. This is the common case for benchmarks using
+    // kv_page_indexer=torch.arange(...).
+    if (num_of_page > 0 && page_stride == page_bytes) {
+      const int32_t first = page_idx[0];
+      if (first < 0 || first >= total_pages) {
+        throw std::runtime_error("kv page index out of range in cpu_scatter.");
+      }
+      bool contiguous = true;
+      for (int64_t local_page = 1; local_page < num_of_page; ++local_page) {
+        const int32_t expected = first + static_cast<int32_t>(local_page);
+        if (page_idx[local_page] != expected) {
+          contiguous = false;
+          break;
+        }
+      }
+      if (contiguous) {
+        const int32_t last = first + static_cast<int32_t>(num_of_page - 1);
+        if (last < 0 || last >= total_pages) {
+          throw std::runtime_error("kv page index out of range in cpu_scatter.");
+        }
+        char *dst_ptr = info.base_ptr + static_cast<int64_t>(first) * page_stride;
+        std::memcpy(dst_ptr, block, static_cast<size_t>(num_of_page) * static_cast<size_t>(page_bytes));
+        return;
+      }
+    }
 
     for (int64_t local_page = 0; local_page < num_of_page; ++local_page) {
       const int32_t dst_page = page_idx[local_page];
@@ -421,6 +553,32 @@ private:
     const int64_t total_pages = info.num_of_page;
     const int64_t page_bytes = page_size;
 
+    // Fast path: if source pages are contiguous in memory and indices form a contiguous range,
+    // we can gather the entire span in one memcpy.
+    if (num_of_page > 0 && page_stride == page_bytes) {
+      const int32_t first = page_idx[0];
+      if (first < 0 || first >= total_pages) {
+        throw std::runtime_error("kv page index out of range in cpu_gather.");
+      }
+      bool contiguous = true;
+      for (int64_t local_page = 1; local_page < num_of_page; ++local_page) {
+        const int32_t expected = first + static_cast<int32_t>(local_page);
+        if (page_idx[local_page] != expected) {
+          contiguous = false;
+          break;
+        }
+      }
+      if (contiguous) {
+        const int32_t last = first + static_cast<int32_t>(num_of_page - 1);
+        if (last < 0 || last >= total_pages) {
+          throw std::runtime_error("kv page index out of range in cpu_gather.");
+        }
+        const char *src_ptr = info.base_ptr + static_cast<int64_t>(first) * page_stride;
+        std::memcpy(block, src_ptr, static_cast<size_t>(num_of_page) * static_cast<size_t>(page_bytes));
+        return;
+      }
+    }
+
     for (int64_t local_page = 0; local_page < num_of_page; ++local_page) {
       const int32_t src_page = page_idx[local_page];
       if (src_page < 0 || src_page >= total_pages) {
@@ -434,26 +592,33 @@ private:
     }
   }
 
-  size_t block_size_;                                   ///< Block size
-  unique_ptr<LocalStorageEngine> storage_;              ///< Local storage engine
-  vector<thread> workers_;                              ///< Worker threads
-  bool stop_;                                           ///< Thread stop flag
-  size_t num_workers_;                                  ///< Number of worker threads
-  vector<unique_ptr<char[]>> r_cpu_buffers_;            ///< CPU buffers for read worker (RAII managed)
-  vector<unique_ptr<char[]>> w_cpu_buffers_;            ///< CPU buffers for write worker (RAII managed)
-  std::atomic<uint64_t> total_written_bytes_;           ///< Total bytes written to disk
-  std::atomic<int64_t> first_write_time_ticks_;         ///< First write start time in steady clock ticks
-  std::atomic<int64_t> last_write_time_ticks_;          ///< Last write completion time in steady clock ticks
-  std::mutex log_mutex_;                                ///< Protects write rate reporting
-  std::chrono::steady_clock::time_point last_log_time_; ///< Last write log timestamp
-  uint64_t last_logged_bytes_;                          ///< Bytes recorded at last write log
+  size_t block_size_;                        ///< Block size
+  unique_ptr<LocalStorageEngine> storage_;   ///< Local storage engine
+  vector<thread> workers_;                   ///< Worker threads
+  bool stop_;                                ///< Thread stop flag
+  size_t num_workers_;                       ///< Number of worker threads
+  vector<unique_ptr<char[]>> r_cpu_buffers_; ///< CPU buffers for read worker (RAII managed)
+  vector<unique_ptr<char[]>> w_cpu_buffers_; ///< CPU buffers for write worker (RAII managed)
 
-  std::atomic<uint64_t> total_read_bytes_;                   ///< Total bytes read from disk
-  std::atomic<int64_t> first_read_time_ticks_;               ///< First read start time in steady clock ticks
-  std::atomic<int64_t> last_read_time_ticks_;                ///< Last read completion time in steady clock ticks
-  std::mutex read_log_mutex_;                                ///< Protects read rate reporting
-  std::chrono::steady_clock::time_point read_last_log_time_; ///< Last read log timestamp
-  uint64_t read_last_logged_bytes_;                          ///< Bytes recorded at last read log
+  bool bandwidth_log_{true};
+  bool online_mode_{false};
+
+  std::atomic<uint64_t> total_written_bytes_{0};
+  std::atomic<uint64_t> window_logical_written_bytes_{0};
+  std::atomic<int64_t> window_logical_write_time_ticks_{0};
+  std::atomic<int64_t> first_write_time_ticks_{0};
+  std::atomic<int64_t> last_write_time_ticks_{0};
+  std::mutex log_mutex_;
+  std::chrono::steady_clock::time_point last_log_time_{};
+  uint64_t last_logged_bytes_{0};
+
+  std::atomic<uint64_t> total_read_bytes_{0};
+  std::atomic<uint64_t> window_logical_read_bytes_{0};
+  std::atomic<int64_t> window_logical_read_time_ticks_{0};
+  std::atomic<int64_t> first_read_time_ticks_{0};
+  std::atomic<int64_t> last_read_time_ticks_{0};
+  std::mutex read_log_mutex_;
+  uint64_t read_last_logged_bytes_{0};
 
   // Ensure the backing storage path exposes enough disk capacity for the requested cache size.
   static void ensure_disk_capacity(const string &file, size_t storage_size, size_t num_shard) {

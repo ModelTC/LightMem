@@ -98,6 +98,63 @@ Controls the maximum size of each cache block in megabytes (MB).
   - **Smaller blocks** (e.g., 16): More fine-grained control, better for random access, but higher overhead per operation
   - Must be set before starting the cache service
 
+    #### Index Persistence (Optional)
+
+    LightMem can persist the hash index to an external index backend. When LightMem restarts (even after a process crash), as long as the backend is still running, LightMem can rebuild the in-memory hash index from it and continue using the existing local disk cache files.
+
+    It also writes recovery metadata to each shard's `meta` file using **SuperBlock + Journal (truncate mode)**. If the index backend is not available (or index data is missing), LightMem can fall back to replaying the local journal to rebuild the index.
+
+    Enable by passing parameters to `PyLocalCacheService`:
+
+    - `index_endpoint` (optional; `""` disables index; `host` uses default ports; `host:port` is explicit)
+    - `coord_endpoints` (optional override; format: `host[:port][,host2[:port]...]`)
+    - `coord_ttl` / `coord_reconcile_sec` (optional; coordinator timing knobs)
+
+    Single-host default ports (recommended):
+
+    ```python
+    from light_mem import PyLocalCacheService
+
+    svc = PyLocalCacheService(
+      kvcache_tensor=kvcache_tensor,
+      file=file,
+      index_endpoint="127.0.0.1",
+    )
+    ```
+
+    Custom ports / explicit overrides:
+
+    ```python
+    from light_mem import PyLocalCacheService
+
+    svc = PyLocalCacheService(
+      kvcache_tensor=kvcache_tensor,
+      file=file,
+      index_endpoint="127.0.0.1:16379",
+      coord_endpoints="127.0.0.1:12379",
+    )
+    ```
+
+    You can also use `lightmem_server` to start dependency services with one command.
+
+#### `lightmem_server` (one command)
+
+After installing LightMem, you can start dependency services via a single command:
+
+```bash
+lightmem_server
+```
+
+It uses Docker Compose to run:
+- an index backend for persistence / global dedupe
+- a coordinator backend for multi-node shard coordination (optional)
+
+`lightmem_server` prints an example Python snippet you can use for LightMem clients (it uses `index_endpoint="127.0.0.1"` when using default ports).
+
+To enable multi-node shard coordination, pass `coord_endpoints` to `PyLocalCacheService`.
+
+Tip: you can also pass `--coord-ttl` / `--coord-reconcile-sec` to `lightmem_server` to include these values in the printed client snippet.
+
 ## Quick Start
 
 ### Key Concepts

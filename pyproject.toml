@@ -8,6 +8,9 @@ dependencies = [
     'numpy>=1.25.1'
 ]
 
+[project.scripts]
+lightmem_server = "light_mem.server_cli:main"
+
 [build-system]
 requires = ["py-build-cmake~=0.4.3"]
 build-backend = "py_build_cmake.build"
@@ -17,7 +20,7 @@ name = "light_mem"
 directory = "python"
 
 [tool.py-build-cmake.sdist]
-include = ["CMakeLists.txt", "src"]
+include = ["CMakeLists.txt", "src", "python"]
 
 [tool.py-build-cmake.cmake]
 minimum_version = "3.24"
