@@ -4,6 +4,7 @@
 #include "core/error.h"
 
 #include <string>
+#include <vector>
 
 namespace cache::storage {
 
@@ -15,9 +16,9 @@ public:
   virtual ~StorageEngine() = default;
 
   /**
-   * @brief 查询存储引擎是否保存了给定的哈希值
+   * @brief 批量查询存储引擎是否保存了给定的哈希值列表
    */
-  virtual bool query(const std::string &hash) = 0;
+  virtual std::vector<bool> queryMany(const std::vector<std::string> &hashs) = 0;
 
   /**
    * @brief 写入给定的数据到存储引擎

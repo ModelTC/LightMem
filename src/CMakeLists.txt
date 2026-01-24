@@ -16,19 +16,26 @@ list(APPEND CMAKE_PREFIX_PATH "${_torch_cmake_path}")
 message(STATUS "CMAKE_PREFIX_PATH: ${CMAKE_PREFIX_PATH}")
 
 find_package(Boost REQUIRED)
+find_package(ZLIB REQUIRED)
 find_package(Torch REQUIRED)
 find_library(TORCH_PYTHON_LIBRARY torch_python PATH "${TORCH_INSTALL_PREFIX}/lib")
 
 # sources list
 set(source
-    pybind.cpp)
+  pybind.cpp
+  storage/local_cache_index.cpp
+  storage/local_storage_engine_public.cpp
+  storage/local_storage_engine_shard.cpp
+  storage/local_storage_engine_files.cpp
+  storage/local_storage_engine_journal.cpp
+  storage/local_storage_engine_recovery.cpp)
 
 # library
 Python_add_library(${name} MODULE ${source} WITH_SOABI)
 target_include_directories(${name} PRIVATE .)
 target_compile_definitions(${name} PRIVATE MODULE_NAME=${name})
 target_compile_features(${name} PRIVATE cxx_std_17)
-target_link_libraries(${name} PRIVATE Python::Python Boost::boost ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY})
+target_link_libraries(${name} PRIVATE Python::Python Boost::boost ZLIB::ZLIB ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY})
 
 # Fix for macOS ARM64: use flat namespace to resolve symbols properly
 if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")

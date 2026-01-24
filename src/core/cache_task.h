@@ -4,6 +4,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -69,6 +70,12 @@ public:
       throw std::invalid_argument("Invalid mode string. Use 'r' for Read or 'w' for Write.");
     }
 
+    // Timestamp (steady clock ticks) for end-to-end task latency measurement.
+    // This matches Python-side timing that measures create() -> ready().
+    const auto now_duration = std::chrono::steady_clock::now().time_since_epoch();
+    const int64_t now_ticks = static_cast<int64_t>(now_duration.count());
+    submit_time_ticks.store(now_ticks, std::memory_order_relaxed);
+
     blocks.reserve(hashs.size());
   }
 
@@ -112,6 +119,11 @@ public:
   Mode operation_mode;
   std::atomic<bool> completion_notified;
   std::vector<int32_t> page_already_list;
+
+  // End-to-end timing hooks.
+  // NOTE: These are best-effort for logging/metrics, not correctness.
+  std::atomic<int64_t> submit_time_ticks{0};
+  std::atomic<int64_t> finish_time_ticks{0};
 };
 
 } // namespace cache::task

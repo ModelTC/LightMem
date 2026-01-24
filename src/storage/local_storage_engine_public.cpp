@@ -1,0 +1,791 @@
+#include "storage/local_storage_engine.h"
+
+#include "config.h"
+
+#include <fcntl.h>
+#include <unistd.h>
+
+#include "utils/fsync_compat.h"
+
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <stdexcept>
+#include <thread>
+#include <unordered_map>
+
+namespace cache {
+namespace storage {
+
+std::optional<LocalStorageEngine::LocalShardHintHit> LocalStorageEngine::localShardHint(const std::string &hash) const {
+  if (!online_mode_) {
+    std::fprintf(stderr, "[light_mem error] localShardHint called in offline mode\n");
+    return std::nullopt;
+  }
+
+  const size_t b = localHintBucket(hash);
+  std::shared_lock<std::shared_mutex> lk(local_hint_mu_[b]);
+  auto it = local_hash_to_shard_[b].find(hash);
+  if (it == local_hash_to_shard_[b].end()) {
+    return std::nullopt;
+  }
+  const size_t shard_id = it->second;
+  if (shard_id >= shard_) {
+    return std::nullopt;
+  }
+
+  // Acquire inflight inside localShardHint(). This closes the window between a successful hint
+  // check and the caller starting the local-hit read path.
+  auto inflight_guard = shard_inflight_[shard_id].acquire();
+
+  // In online mode, a shard in draining state is treated as not eligible for local-hit fast path.
+  // Re-check after acquiring inflight to avoid returning a hint during/after handoff.
+  if (!isShardWritable(shard_id, nullptr)) {
+    return std::nullopt;
+  }
+
+  return LocalShardHintHit{shard_id, std::move(inflight_guard)};
+}
+
+void LocalStorageEngine::noteLocalShardHint(const std::string &hash, size_t shard_id) {
+  if (!online_mode_) {
+    std::fprintf(stderr, "[light_mem error] noteLocalShardHint called in offline mode\n");
+    return;
+  }
+
+  if (shard_id >= shard_) {
+    return;
+  }
+  // Only record hints for shards eligible for local-hit fast path.
+  if (!isShardWritable(shard_id, nullptr)) {
+    return;
+  }
+
+  // Fast-path: avoid exclusive lock when the mapping is already up-to-date.
+  const size_t b = localHintBucket(hash);
+  {
+    std::shared_lock<std::shared_mutex> lk(local_hint_mu_[b]);
+    auto it = local_hash_to_shard_[b].find(hash);
+    if (it != local_hash_to_shard_[b].end() && it->second == shard_id) {
+      return;
+    }
+  }
+  std::unique_lock<std::shared_mutex> lk(local_hint_mu_[b]);
+  local_hash_to_shard_[b][hash] = shard_id;
+}
+
+void LocalStorageEngine::eraseLocalShardHint(const std::string &hash) {
+  if (!online_mode_) {
+    std::fprintf(stderr, "[light_mem error] eraseLocalShardHint called in offline mode\n");
+    return;
+  }
+
+  // Fast-path: avoid exclusive lock if the key is absent.
+  const size_t b = localHintBucket(hash);
+  {
+    std::shared_lock<std::shared_mutex> lk(local_hint_mu_[b]);
+    if (local_hash_to_shard_[b].find(hash) == local_hash_to_shard_[b].end()) {
+      return;
+    }
+  }
+  std::unique_lock<std::shared_mutex> lk(local_hint_mu_[b]);
+  local_hash_to_shard_[b].erase(hash);
+}
+
+LocalStorageEngine::LocalStorageEngine(const std::string &filename, const size_t storage_size, const size_t shard,
+                                       const size_t block_size, const std::string &index_endpoint,
+                                       const std::string &index_prefix)
+    : filename_(filename), storage_size_(storage_size), shard_(shard), block_size_(block_size),
+      online_mode_(!index_endpoint.empty()) {
+  // 每个 shard 分到的文件大小
+  const size_t shard_storage_size = storage_size_ / shard_;
+  // 每个 shard 能存储的块数
+  const size_t shard_capacity = shard_storage_size / block_size;
+
+  caches_.resize(shard_);
+  io_locks_.resize(shard_);
+  file_fds_.resize(shard_, -1);
+  meta_fds_.resize(shard_, -1);
+  journal_entries_.assign(shard_, 0);
+  superblock_seq_.assign(shard_, 0);
+  superblock_stable_offset_.assign(shard_, META_HEADER_SIZE);
+  superblock_epoch_.assign(shard_, 0);
+  shard_recovered_epoch_.assign(shard_, 0);
+
+  shard_writable_ = std::make_unique<std::atomic<uint8_t>[]>(shard_);
+  shard_draining_ = std::make_unique<std::atomic<uint8_t>[]>(shard_);
+  shard_epoch_cache_ = std::make_unique<std::atomic<uint64_t>[]>(shard_);
+  shard_inflight_ = std::make_unique<InflightCounter[]>(shard_);
+  shard_written_bytes_ = std::make_unique<std::atomic<uint64_t>[]>(shard_);
+  for (size_t i = 0; i < shard_; i++) {
+    shard_writable_[i].store(1, std::memory_order_relaxed);
+    shard_draining_[i].store(0, std::memory_order_relaxed);
+    shard_epoch_cache_[i].store(0, std::memory_order_relaxed);
+    shard_inflight_[i].store(0, std::memory_order_relaxed);
+    shard_written_bytes_[i].store(0, std::memory_order_relaxed);
+  }
+
+  journal_mu_.resize(shard_);
+  journal_cv_.resize(shard_);
+  journal_queue_.resize(shard_);
+  journal_stop_.assign(shard_, false);
+
+  initIndexBackend(index_endpoint, index_prefix);
+
+  // Non-strict by default: if index backend is configured but unreachable, warn and proceed without it.
+  if (redis_lock_) {
+    if (!redis_lock_->connect()) {
+      std::fprintf(stderr, "[light_mem warning] index backend is configured but not reachable; "
+                           "continuing without index persistence\n");
+      redis_lock_.reset();
+      redis_pool_.clear();
+    }
+  }
+
+  try {
+    for (size_t i = 0; i < shard_; i++) {
+      caches_[i] = std::make_shared<LocalCacheIndex>(shard_capacity);
+      io_locks_[i] = std::make_shared<std::shared_mutex>();
+      journal_mu_[i] = std::make_unique<std::mutex>();
+      journal_cv_[i] = std::make_unique<std::condition_variable>();
+    }
+
+    // Make localShardHint authoritative: update hint under the same LocalCacheIndex mutex
+    // for any ready insertions and removals/evictions.
+    if (online_mode_) {
+      for (size_t i = 0; i < shard_; i++) {
+        caches_[i]->set_hooks(
+            [this, i](const std::string &hash) { noteLocalShardHint(hash, i); },
+            [this](const std::string &hash) { eraseLocalShardHint(hash); });
+      }
+    }
+    createOrOpenFiles(shard_storage_size);
+    if (!online_mode_) {
+      recoverAllShards(shard_capacity);
+    }
+    startJournalWorkers();
+  } catch (...) {
+    cleanup();
+    throw;
+  }
+}
+
+LocalStorageEngine::~LocalStorageEngine() {
+  stopJournalWorkers();
+  cleanup();
+}
+
+std::vector<bool> LocalStorageEngine::queryMany(const std::vector<std::string> &hashs) {
+  std::vector<bool> ret;
+  ret.assign(hashs.size(), false);
+
+  // Offline mode: local lookup only.
+  if (!online_mode_) {
+    for (size_t i = 0; i < hashs.size(); i++) {
+      const std::string &hash = hashs[i];
+      const size_t shard_id = getShard(hash);
+      ret[i] = caches_[shard_id]->exists(hash);
+    }
+    return ret;
+  }
+
+  // Single-node online fast mode (index backend configured, but not under coordinator control):
+  // - Prefer local index for speed.
+  // - Fall back to Redis global index for cold-start / restart cases (e.g., after recoverShardToRedis()).
+  if (!coordinatedMode()) {
+    std::vector<std::string> need_redis_hash;
+    std::vector<size_t> need_redis_idx;
+    need_redis_hash.reserve(hashs.size());
+    need_redis_idx.reserve(hashs.size());
+
+    for (size_t i = 0; i < hashs.size(); i++) {
+      const std::string &hash = hashs[i];
+      const size_t shard_id = getShard(hash);
+      if (caches_[shard_id] && caches_[shard_id]->exists(hash)) {
+        ret[i] = true;
+        continue;
+      }
+      need_redis_hash.emplace_back(hash);
+      need_redis_idx.emplace_back(i);
+    }
+
+    if (need_redis_hash.empty()) {
+      return ret;
+    }
+
+    if (redis_lock_ && redis_lock_->connect()) {
+      auto vals = redis_lock_->hmget(redis_lock_->globalIndexKey(), need_redis_hash);
+      if (vals.has_value() && vals->size() == need_redis_hash.size()) {
+        for (size_t j = 0; j < vals->size(); j++) {
+          const std::string &s = (*vals)[j];
+          if (s.empty()) {
+            continue;
+          }
+          const auto pos = s.find(':');
+          if (pos == std::string::npos) {
+            continue;
+          }
+          try {
+            const size_t shard_id = static_cast<size_t>(std::stoull(s.substr(0, pos)));
+            if (shard_id >= shard_) {
+              continue;
+            }
+            ret[need_redis_idx[j]] = true;
+          } catch (...) {
+            continue;
+          }
+        }
+      }
+    }
+
+    return ret;
+  }
+
+  // First pass: local hint + shard-local index.
+  // We only treat it as a hit without Redis re-validation if the shard is currently owned.
+  std::vector<std::string> need_redis_hash;
+  std::vector<size_t> need_redis_idx;
+  need_redis_hash.reserve(hashs.size());
+  need_redis_idx.reserve(hashs.size());
+
+  for (size_t i = 0; i < hashs.size(); i++) {
+    const std::string &hash = hashs[i];
+    if (auto hinted = localShardHint(hash); hinted.has_value() && hinted->shard_id < shard_) {
+      const size_t sid = hinted->shard_id;
+      if (sid < shard_ && caches_[sid] && caches_[sid]->exists(hash)) {
+        ret[i] = true;
+        continue;
+      }
+      eraseLocalShardHint(hash);
+    }
+    need_redis_hash.emplace_back(hash);
+    need_redis_idx.emplace_back(i);
+  }
+
+  if (need_redis_hash.empty()) {
+    return ret;
+  }
+
+  // Second pass: Redis global index (batched).
+  if (redis_lock_ && redis_lock_->connect()) {
+    auto vals = redis_lock_->hmget(redis_lock_->globalIndexKey(), need_redis_hash);
+    if (vals.has_value() && vals->size() == need_redis_hash.size()) {
+      for (size_t j = 0; j < vals->size(); j++) {
+        const std::string &s = (*vals)[j];
+        if (s.empty()) {
+          continue;
+        }
+        const auto pos = s.find(':');
+        if (pos == std::string::npos) {
+          continue;
+        }
+        try {
+          const size_t shard_id = static_cast<size_t>(std::stoull(s.substr(0, pos)));
+          if (shard_id >= shard_) {
+            continue;
+          }
+          ret[need_redis_idx[j]] = true;
+        } catch (...) {
+          continue;
+        }
+      }
+      return ret;
+    }
+    // If Redis IO/parsing fails, treat as miss (no local full-scan fallback).
+  }
+  return ret;
+}
+
+size_t LocalStorageEngine::write(const char *buf, const std::string &hash) {
+  // Legacy entry: full-block CRC.
+  const uint32_t crc = compute_crc32(buf, block_size_);
+  return write(buf, hash, crc, static_cast<uint32_t>(block_size_));
+}
+
+size_t LocalStorageEngine::write(const char *buf, const std::string &hash, uint32_t data_crc, uint32_t len_bytes) {
+  if (len_bytes == 0 || static_cast<size_t>(len_bytes) > block_size_) {
+    return 0;
+  }
+
+  // Offline mode (single-node local cache):
+  // Keep the write hot path lightweight.
+  // Multi-node durability/consistency (WAL + CRC + fsync + fencing) is only required in online_mode_.
+  if (!online_mode_) {
+    const size_t shard_id = getShard(hash);
+    if (shard_id >= shard_) {
+      return 0;
+    }
+
+    auto inflight_guard = shard_inflight_[shard_id].acquire();
+
+    size_t slot_id = 0;
+    std::string evicted_hash;
+
+    // Acquire a slot. In offline mode we should not silently drop writes due to temporary congestion.
+    // Retry briefly to wait for other in-flight writes to finish.
+    int result = -1;
+    for (int attempt = 0; attempt < 64; ++attempt) {
+      result = caches_[shard_id]->acquire_slot(hash, slot_id, evicted_hash);
+      if (result >= 0) {
+        break;
+      }
+      std::this_thread::yield();
+    }
+    if (result < 0) {
+      return 0;
+    }
+    if (result == 0) {
+      return block_size_; // Local duplicate: data already on disk and ready.
+    }
+
+    const size_t offset_bytes = slot_id * block_size_;
+    try {
+      std::unique_lock<std::shared_mutex> lock(*io_locks_[shard_id]);
+      // Offline hot-path: only write the valid logical bytes, not the full block.
+      // For a 1-page write this reduces I/O from ~64 MB to ~1 MB.
+      if (!pwriteAll(file_fds_[shard_id], buf, static_cast<size_t>(len_bytes), static_cast<off_t>(offset_bytes))) {
+        throw std::runtime_error("pwrite failed, errno=" + std::to_string(errno));
+      }
+      // Intentionally do not fdatasync/fsync in offline mode: this is a cache, not a database.
+      // Avoid turning every block write into a durability barrier.
+    } catch (const std::exception &e) {
+      std::fprintf(stderr, "[light_mem error] write(offline): I/O failed (shard=%zu hash=%s): %s\n",
+                   shard_id, hash.c_str(), e.what());
+      caches_[shard_id]->remove(hash);
+      return 0;
+    }
+
+    // Mark ready immediately after the data write completes.
+    caches_[shard_id]->mark_ready(hash, 0);
+
+    // Offline mode: also enqueue journal metadata asynchronously so restart recovery
+    // can rebuild from snapshot + WAL without blocking the write hot path.
+    auto task = std::make_shared<JournalTask>();
+    task->shard_id = shard_id;
+    task->epoch = 0;
+    task->write_offset = static_cast<uint64_t>(offset_bytes);
+    task->write_len = len_bytes;
+    task->data_crc = 0;
+    task->slot_id = slot_id;
+    task->hash = hash;
+    task->evicted_hash = evicted_hash;
+    {
+      std::lock_guard<std::mutex> lk(*journal_mu_[shard_id]);
+      journal_queue_[shard_id].push_back(task);
+    }
+    journal_cv_[shard_id]->notify_one();
+
+#ifndef __APPLE__
+    // Linux regression fix: keep offline write path aligned with historical behavior.
+    // Drop newly written data pages from page cache to avoid polluting subsequent read cache.
+    (void)posix_fadvise(file_fds_[shard_id], static_cast<off_t>(offset_bytes), static_cast<off_t>(len_bytes),
+                        POSIX_FADV_DONTNEED);
+#endif
+
+    shard_written_bytes_[shard_id].fetch_add(static_cast<uint64_t>(block_size_), std::memory_order_relaxed);
+
+    return block_size_;
+  }
+
+  const bool strict = coordinatedMode();
+
+  const bool redis_connected = (redis_lock_ && redis_lock_->connect());
+  // Global dedupe/locking is only required in strict multi-node mode.
+  const bool do_global_dedupe = strict && online_mode_ && redis_connected;
+  const std::string global_key = do_global_dedupe ? redis_lock_->globalIndexKey() : std::string();
+  const std::string lock_key = do_global_dedupe ? redis_lock_->hashLockKey(hash) : std::string();
+
+  // Track whether we hold the distributed Redis lock for this hash.
+  bool lock_held = false;
+  if (do_global_dedupe) {
+    // Redis global-index hit is not always a valid dedupe signal: after local cache reset,
+    // Redis may still contain stale mappings. For mappings that point to shards writable on
+    // this node, require local presence (and CRC match when available) before deduping.
+    auto shouldDedupeGlobalHit = [&](const std::string &mapping) -> bool {
+      const auto pos = mapping.find(':');
+      if (pos == std::string::npos) {
+        return true;
+      }
+
+      size_t mapped_shard = 0;
+      try {
+        mapped_shard = static_cast<size_t>(std::stoull(mapping.substr(0, pos)));
+      } catch (...) {
+        return true;
+      }
+
+      if (mapped_shard >= shard_) {
+        return true;
+      }
+
+      // If this node doesn't currently own/write the shard, keep global dedupe behavior.
+      if (!isShardWritable(mapped_shard, nullptr)) {
+        return true;
+      }
+
+      size_t local_slot = 0;
+      uint32_t local_crc = 0;
+      if (!caches_[mapped_shard]->get_offset_and_crc(hash, local_slot, local_crc)) {
+        return false;
+      }
+
+      if (data_crc != 0 && local_crc != 0 && local_crc != data_crc) {
+        return false;
+      }
+
+      return true;
+    };
+
+    if (auto cur = redis_lock_->hget(global_key, hash); cur.has_value() && shouldDedupeGlobalHit(*cur)) {
+      return 0;
+    }
+
+    if (!redis_lock_->setStringNxPx(lock_key, "1", 30000)) {
+      return 0;
+    }
+    lock_held = true;
+
+    // Re-check under lock to close races with concurrent writers.
+    if (auto cur = redis_lock_->hget(global_key, hash); cur.has_value() && shouldDedupeGlobalHit(*cur)) {
+      return 0;
+    }
+  }
+
+  // RAII: release the distributed Redis lock on any exit path.
+  struct LockRelease {
+    bool &held;
+    RedisClient *client;
+    const std::string &key;
+    ~LockRelease() {
+      if (held && client) {
+        (void)client->del(key);
+      }
+    }
+  } lock_release{lock_held, redis_lock_.get(), lock_key};
+
+  // In single-node online mode (non-strict), keep deterministic sharding for O(1) local lookup.
+  const size_t shard_id = (online_mode_ && strict) ? pickWritableShard(hash) : getShard(hash);
+  if (shard_id >= shard_) {
+    return 0;
+  }
+
+  auto inflight_guard = shard_inflight_[shard_id].acquire();
+  uint64_t epoch = 0;
+  if (!isShardWritable(shard_id, strict ? &epoch : nullptr)) {
+    return 0;
+  }
+
+  size_t slot_id = 0;
+  std::string evicted_hash;
+
+  // 1. Acquire slot (LRU)
+  int result = -1;
+  for (int attempt = 0; attempt < 64; ++attempt) {
+    result = caches_[shard_id]->acquire_slot(hash, slot_id, evicted_hash);
+    if (result >= 0) {
+      break;
+    }
+    // Temporary congestion: other in-flight writers hold all slots. Yield and retry.
+    std::this_thread::yield();
+  }
+  if (result < 0) {
+    return 0;
+  }
+
+  // If the hash already exists locally, we normally treat it as a dedupe hit.
+  // However, users may reuse the same hash across runs with different in-memory content
+  if (result == 0) {
+    size_t existing_slot = 0;
+    uint32_t existing_crc = 0;
+    if (caches_[shard_id]->get_offset_and_crc(hash, existing_slot, existing_crc)) {
+      if (existing_crc != 0 && data_crc != 0 && existing_crc != data_crc) {
+        // Content differs: drop the old mapping and retry slot acquisition so we overwrite on disk.
+        caches_[shard_id]->remove(hash);
+
+        // Retry acquire_slot() once (with congestion retries).
+        result = -1;
+        evicted_hash.clear();
+        for (int attempt = 0; attempt < 64; ++attempt) {
+          result = caches_[shard_id]->acquire_slot(hash, slot_id, evicted_hash);
+          if (result >= 0) {
+            break;
+          }
+          std::this_thread::yield();
+        }
+        if (result < 0) {
+          return 0;
+        }
+      } else if (existing_crc == 0 && data_crc != 0) {
+        // Best-effort: populate local CRC if it was missing.
+        caches_[shard_id]->mark_ready(hash, data_crc);
+      }
+    }
+  }
+
+  if (result == 0) {
+    // Local duplicate: data already on disk.
+    // In online mode, repopulate Redis mappings if the entry is ready.
+    // If another thread is still writing (not ready), it will push to Redis via journal worker.
+    if (do_global_dedupe) {
+      size_t existing_slot = 0;
+      uint32_t existing_crc = 0;
+      if (caches_[shard_id]->get_offset_and_crc(hash, existing_slot, existing_crc)) {
+        const std::string shard_slot = std::to_string(shard_id) + ":" + std::to_string(existing_slot);
+        std::vector<std::vector<std::string>> cmds;
+        cmds.reserve(existing_crc != 0 ? 3 : 2);
+        cmds.push_back({"HSET", redis_lock_->shardIndexKey(shard_id), hash, std::to_string(existing_slot)});
+        cmds.push_back({"HSET", global_key, hash, shard_slot});
+        if (existing_crc != 0) {
+          cmds.push_back({"HSET", redis_lock_->globalCrcKey(), hash, std::to_string(existing_crc)});
+        }
+        (void)redis_lock_->pipeline(cmds);
+      }
+    } else if (online_mode_ && !strict && redis_connected) {
+      // Single-node online fast mode: publish mapping asynchronously (no distributed lock, no CRC required).
+      size_t existing_slot = 0;
+      uint32_t existing_crc = 0;
+      if (caches_[shard_id]->get_offset_and_crc(hash, existing_slot, existing_crc)) {
+        auto t = std::make_shared<JournalTask>();
+        t->shard_id = shard_id;
+        t->epoch = 0;
+        t->write_offset = static_cast<uint64_t>(existing_slot * block_size_);
+        t->write_len = len_bytes;
+        t->data_crc = existing_crc;
+        t->slot_id = existing_slot;
+        t->hash = hash;
+        t->evicted_hash.clear();
+        {
+          std::lock_guard<std::mutex> lk(*journal_mu_[shard_id]);
+          journal_queue_[shard_id].push_back(t);
+        }
+        journal_cv_[shard_id]->notify_one();
+      }
+    }
+    return block_size_;
+  }
+
+  // If LRU evicted something, delete its Redis mappings *before* we overwrite the slot.
+  // This avoids a window where stale Redis mapping points to overwritten data.
+  if (do_global_dedupe && !evicted_hash.empty()) {
+    // NOTE: best-effort; a Redis failure here can lead to stale mapping.
+    (void)redis_lock_->pipeline({
+        {"HDEL", redis_lock_->shardIndexKey(shard_id), evicted_hash},
+        {"HDEL", global_key, evicted_hash},
+        {"HDEL", redis_lock_->globalCrcKey(), evicted_hash},
+    });
+  }
+
+  // 2. Write data to data file (overwrite).
+  // In non-strict (single-node online) mode, only write the valid logical bytes to reduce I/O.
+  const size_t write_bytes = strict ? block_size_ : static_cast<size_t>(len_bytes);
+  const size_t offset_bytes = slot_id * block_size_;
+  try {
+    std::unique_lock<std::shared_mutex> lock(*io_locks_[shard_id]);
+    if (!pwriteAll(file_fds_[shard_id], buf, write_bytes, static_cast<off_t>(offset_bytes))) {
+      throw std::runtime_error("pwrite failed, errno=" + std::to_string(errno));
+    }
+    if (strict) {
+      if (cache::utils::fdatasync_compat(file_fds_[shard_id]) != 0) {
+        throw std::runtime_error("fdatasync failed, errno=" + std::to_string(errno));
+      }
+    }
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "[light_mem error] write: I/O failed (shard=%zu hash=%s): %s\n",
+                 shard_id, hash.c_str(), e.what());
+    caches_[shard_id]->remove(hash);
+    return 0;
+  }
+
+  if (strict) {
+    // Fence again after data is durable (handles revocation mid-write).
+    uint64_t epoch2 = 0;
+    if (!isShardWritable(shard_id, &epoch2) || epoch2 != epoch) {
+      caches_[shard_id]->remove(hash);
+      return 0;
+    }
+  }
+
+  // 3. Enqueue journal+redis update; handled by the per-shard journal worker.
+  // CRC is computed by the caller over `len_bytes` to avoid hashing unused tail bytes.
+  auto task = std::make_shared<JournalTask>();
+  task->shard_id = shard_id;
+  task->epoch = epoch;
+  task->write_offset = static_cast<uint64_t>(offset_bytes);
+  task->write_len = len_bytes;
+  task->data_crc = data_crc;
+  task->slot_id = slot_id;
+  task->hash = hash;
+  task->evicted_hash = evicted_hash;
+
+  {
+    std::lock_guard<std::mutex> lk(*journal_mu_[shard_id]);
+    journal_queue_[shard_id].push_back(task);
+  }
+  journal_cv_[shard_id]->notify_one();
+
+  if (strict) {
+    // Synchronous commit: wait until journal worker makes the record durable.
+    {
+      std::unique_lock<std::mutex> lk(task->mu);
+      task->cv.wait(lk, [&] { return task->done; });
+    }
+
+    if (!task->success) {
+      caches_[shard_id]->remove(hash);
+      return 0;
+    }
+  } else {
+    // Fast single-node online mode: do not block writes on WAL/Redis.
+    // Still record CRC locally so it can be snapshotted and published asynchronously.
+    caches_[shard_id]->mark_ready(hash, data_crc);
+  }
+  shard_written_bytes_[shard_id].fetch_add(static_cast<uint64_t>(write_bytes), std::memory_order_relaxed);
+
+#ifndef __APPLE__
+  posix_fadvise(file_fds_[shard_id], offset_bytes, write_bytes, POSIX_FADV_DONTNEED);
+#endif
+
+  return write_bytes;
+}
+
+size_t LocalStorageEngine::read(char *buf, const std::string &hash) {
+  return read(buf, hash, static_cast<uint32_t>(block_size_));
+}
+
+size_t LocalStorageEngine::read(char *buf, const std::string &hash, uint32_t len_bytes) {
+  if (len_bytes == 0 || static_cast<size_t>(len_bytes) > block_size_) {
+    return 0;
+  }
+
+  // Offline mode: local lookup only.
+  if (!online_mode_) {
+    const size_t shard_id = getShard(hash);
+    const size_t slot_id = caches_[shard_id]->get_offset(hash);
+    if (slot_id == static_cast<size_t>(-1)) {
+      return 0;
+    }
+    std::shared_lock<std::shared_mutex> lock(*io_locks_[shard_id]);
+    if (caches_[shard_id]->get_offset(hash) != slot_id) {
+      return 0;
+    }
+    const size_t offset_bytes = slot_id * block_size_;
+    if (!preadAll(file_fds_[shard_id], buf, static_cast<size_t>(len_bytes), static_cast<off_t>(offset_bytes))) {
+      std::fprintf(stderr, "[light_mem error] read: I/O error for hash %s\n", hash.c_str());
+      return 0;
+    }
+    return static_cast<size_t>(len_bytes);
+  }
+
+  // Online mode:
+  // 0) Single-node online fast mode (non-strict): use deterministic local lookup first.
+  // This avoids relying on Redis mappings which can be temporarily stale around evictions.
+  if (!coordinatedMode()) {
+    const size_t shard_id = getShard(hash);
+    if (shard_id < shard_) {
+      const size_t slot_id = caches_[shard_id]->get_offset(hash);
+      if (slot_id != static_cast<size_t>(-1)) {
+        std::shared_lock<std::shared_mutex> lock(*io_locks_[shard_id]);
+        if (caches_[shard_id]->get_offset(hash) != slot_id) {
+          return 0;
+        }
+        const size_t offset_bytes = slot_id * block_size_;
+        if (!preadAll(file_fds_[shard_id], buf, static_cast<size_t>(len_bytes), static_cast<off_t>(offset_bytes))) {
+          std::fprintf(stderr, "[light_mem error] read: I/O error for hash %s\n", hash.c_str());
+          return 0;
+        }
+        return static_cast<size_t>(len_bytes);
+      }
+    }
+  }
+
+  // 1) Local-hit path (authoritative local hint). No CRC validation needed.
+  if (auto hinted = localShardHint(hash); hinted.has_value() && hinted->shard_id < shard_) {
+    const size_t i = hinted->shard_id;
+    std::shared_lock<std::shared_mutex> lock(*io_locks_[i]);
+    const size_t slot_id = caches_[i]->get_offset(hash);
+    if (slot_id != static_cast<size_t>(-1)) {
+      const size_t offset_bytes = slot_id * block_size_;
+      if (!preadAll(file_fds_[i], buf, static_cast<size_t>(len_bytes), static_cast<off_t>(offset_bytes))) {
+        std::fprintf(stderr, "[light_mem error] read: I/O error for hash %s\n", hash.c_str());
+        return 0;
+      }
+      return static_cast<size_t>(len_bytes);
+    }
+    eraseLocalShardHint(hash);
+  }
+
+  // 2) Redis-resolved path (with CRC validation).
+  if (!redis_lock_ || !redis_lock_->connect()) {
+    return 0;
+  }
+
+  size_t slot_id = static_cast<size_t>(-1);
+  auto resolved = findShardInRedis(hash, &slot_id);
+  if (!resolved.has_value() || slot_id == static_cast<size_t>(-1)) {
+    return 0;
+  }
+  const size_t shard_id = *resolved;
+  if (shard_id >= shard_) {
+    return 0;
+  }
+
+  // Fetch and verify CRC.
+  uint32_t expected_crc = 0;
+  auto crc_s = redis_lock_->hget(redis_lock_->globalCrcKey(), hash);
+  if (crc_s.has_value() && !crc_s->empty()) {
+    try { expected_crc = static_cast<uint32_t>(std::stoul(*crc_s)); } catch (...) {}
+  }
+
+  // Safety net: if CRC is absent (e.g., legacy data), do a best-effort read only when not coordinated.
+  if (expected_crc == 0 && !coordinatedMode()) {
+    const size_t offset_bytes = slot_id * block_size_;
+    if (!preadAll(file_fds_[shard_id], buf, static_cast<size_t>(len_bytes), static_cast<off_t>(offset_bytes))) {
+      return 0;
+    }
+    return static_cast<size_t>(len_bytes);
+  }
+
+  if (expected_crc != 0) {
+    const size_t offset_bytes = slot_id * block_size_;
+    if (!preadAll(file_fds_[shard_id], buf, static_cast<size_t>(len_bytes), static_cast<off_t>(offset_bytes))) {
+      return 0; // I/O error; keep Redis mappings intact.
+    }
+    if (compute_crc32(buf, static_cast<size_t>(len_bytes)) == expected_crc) {
+      return static_cast<size_t>(len_bytes);
+    }
+  }
+
+  // CRC unavailable or mismatch: clean up stale Redis mappings.
+  (void)redis_lock_->pipeline({
+      {"HDEL", redis_lock_->globalIndexKey(), hash},
+      {"HDEL", redis_lock_->shardIndexKey(shard_id), hash},
+      {"HDEL", redis_lock_->globalCrcKey(), hash},
+  });
+  return 0;
+}
+
+std::shared_ptr<LocalStorageEngine::HashInfo> LocalStorageEngine::getHashInfo() {
+  auto info = std::make_shared<HashInfo>();
+  info->caches = caches_;
+  info->io_locks = io_locks_;
+  return info;
+}
+
+bool LocalStorageEngine::setHashInfo(const std::shared_ptr<HashInfo> &info) {
+  if (!info) {
+    std::fprintf(stderr, "[light_mem error] setHashInfo: HashInfo is null\n");
+    return false;
+  }
+  if (info->caches.size() != shard_ || info->io_locks.size() != shard_) {
+    std::fprintf(stderr,
+                 "[light_mem error] setHashInfo: shard size mismatch (expected %zu, got caches=%zu io_locks=%zu)\n",
+                 shard_, info->caches.size(), info->io_locks.size());
+    return false;
+  }
+  caches_ = info->caches;
+  io_locks_ = info->io_locks;
+  return true;
+}
+
+} // namespace storage
+} // namespace cache
