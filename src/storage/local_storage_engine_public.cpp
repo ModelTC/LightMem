@@ -7,6 +7,7 @@
 
 #include "utils/fsync_compat.h"
 
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <sstream>
@@ -352,16 +353,33 @@ size_t LocalStorageEngine::write(const char *buf, const std::string &hash) {
     std::unique_lock<std::shared_mutex> lock(*io_locks_[shard_id]);
 
     if (!pwriteAll(file_fds_[shard_id], buf, block_size_, static_cast<off_t>(offset_bytes))) {
-      throw std::runtime_error("Failed to write data");
+      const int err = errno;
+      throw std::runtime_error(std::string("Failed to write data, errno=") + std::to_string(err) +
+                               ", reason=" + std::string(::strerror(err)));
     }
     if (cache::utils::fdatasync_compat(file_fds_[shard_id]) != 0) {
-      throw std::runtime_error("Failed to fdatasync data");
+      const int err = errno;
+      throw std::runtime_error(std::string("Failed to fdatasync data, errno=") + std::to_string(err) +
+                               ", reason=" + std::string(::strerror(err)));
     }
 
     // Compute CRC after data is durable.
     data_crc = ::crc32(0, reinterpret_cast<const Bytef *>(buf), block_size_);
 
+  } catch (const std::exception &e) {
+    std::fprintf(stderr,
+                 "[light_mem error] write: data I/O failed (shard=%zu hash=%s offset=%zu): %s\n",
+                 shard_id, hash.c_str(), offset_bytes, e.what());
+    caches_[shard_id]->remove(hash);
+    eraseLocalShardHint(hash);
+    shard_inflight_[shard_id].fetch_sub(1, std::memory_order_relaxed);
+    if (do_global_dedupe) {
+      (void)redis_lock_->del(lock_key);
+    }
+    return 0;
   } catch (...) {
+    std::fprintf(stderr, "[light_mem error] write: data I/O failed (shard=%zu hash=%s offset=%zu): unknown error\n",
+                 shard_id, hash.c_str(), offset_bytes);
     caches_[shard_id]->remove(hash);
     eraseLocalShardHint(hash);
     shard_inflight_[shard_id].fetch_sub(1, std::memory_order_relaxed);

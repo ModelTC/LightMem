@@ -1,6 +1,8 @@
 #include "storage/local_cache_index.h"
 
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -226,6 +228,8 @@ bool LocalCacheIndex::saveToSnapshot(const std::string &filename) {
   // Shared storage: allow other nodes/users to read+write snapshots.
   int fd = ::open(tmp_filename.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
   if (fd < 0) {
+    std::fprintf(stderr, "[light_mem warning] snapshot save: open failed (file=%s errno=%d %s)\n", filename.c_str(),
+                 errno, std::strerror(errno));
     return false;
   }
 
@@ -259,6 +263,8 @@ bool LocalCacheIndex::saveToSnapshot(const std::string &filename) {
   };
 
   if (!write_all(&magic, sizeof(magic)) || !write_all(&version, sizeof(version)) || !write_all(&count, sizeof(count))) {
+    std::fprintf(stderr, "[light_mem warning] snapshot save: write header failed (file=%s errno=%d %s)\n",
+                 filename.c_str(), errno, std::strerror(errno));
     ::close(fd);
     std::remove(tmp_filename.c_str());
     return false;
@@ -279,6 +285,8 @@ bool LocalCacheIndex::saveToSnapshot(const std::string &filename) {
 
         if (!write_all(&hash_len, sizeof(hash_len)) || !write_all(hash.data(), hash_len) ||
             !write_all(&slot_id, sizeof(slot_id)) || !write_all(&crc, sizeof(crc))) {
+          std::fprintf(stderr, "[light_mem warning] snapshot save: write entry failed (file=%s errno=%d %s)\n",
+                       filename.c_str(), errno, std::strerror(errno));
           ::close(fd);
           std::remove(tmp_filename.c_str());
           return false;
@@ -289,6 +297,8 @@ bool LocalCacheIndex::saveToSnapshot(const std::string &filename) {
 
   // Ensure file contents are durable before rename.
   if (::fsync(fd) != 0) {
+    std::fprintf(stderr, "[light_mem warning] snapshot save: fsync failed (file=%s errno=%d %s)\n", filename.c_str(),
+                 errno, std::strerror(errno));
     ::close(fd);
     std::remove(tmp_filename.c_str());
     return false;
@@ -297,6 +307,8 @@ bool LocalCacheIndex::saveToSnapshot(const std::string &filename) {
 
   // Atomic replace.
   if (std::rename(tmp_filename.c_str(), filename.c_str()) != 0) {
+    std::fprintf(stderr, "[light_mem warning] snapshot save: rename failed (file=%s errno=%d %s)\n", filename.c_str(),
+                 errno, std::strerror(errno));
     std::remove(tmp_filename.c_str());
     return false;
   }
@@ -323,15 +335,26 @@ bool LocalCacheIndex::loadFromSnapshot(const std::string &filename) {
 
   int fd = ::open(filename.c_str(), O_RDONLY);
   if (fd < 0) {
+    if (errno != ENOENT) {
+      std::fprintf(stderr, "[light_mem warning] snapshot load: open failed (file=%s errno=%d %s)\n", filename.c_str(),
+                   errno, std::strerror(errno));
+    }
     return false;
   }
 
+  int last_errno = 0;
+  bool last_eof = false;
   auto read_all = [&](void *p, size_t n) -> bool {
     char *buf = static_cast<char *>(p);
     size_t left = n;
     while (left > 0) {
       ssize_t r = ::read(fd, buf, left);
-      if (r <= 0) {
+      if (r == 0) {
+        last_eof = true;
+        return false;
+      }
+      if (r < 0) {
+        last_errno = errno;
         return false;
       }
       buf += static_cast<size_t>(r);
@@ -345,10 +368,19 @@ bool LocalCacheIndex::loadFromSnapshot(const std::string &filename) {
   uint64_t count = 0;
 
   if (!read_all(&magic, sizeof(magic)) || !read_all(&version, sizeof(version)) || !read_all(&count, sizeof(count))) {
+    if (last_eof) {
+      std::fprintf(stderr, "[light_mem warning] snapshot load: truncated header (file=%s)\n", filename.c_str());
+    } else if (last_errno != 0) {
+      std::fprintf(stderr, "[light_mem warning] snapshot load: read header failed (file=%s errno=%d %s)\n",
+                   filename.c_str(), last_errno, std::strerror(last_errno));
+    }
     ::close(fd);
     return false;
   }
   if (magic != SNAPSHOT_MAGIC || version != SNAPSHOT_VERSION) {
+    std::fprintf(stderr,
+                 "[light_mem warning] snapshot load: bad header (file=%s magic=0x%08x version=%u expect_magic=0x%08x expect_version=%u)\n",
+                 filename.c_str(), magic, version, SNAPSHOT_MAGIC, SNAPSHOT_VERSION);
     ::close(fd);
     return false;
   }
@@ -356,6 +388,7 @@ bool LocalCacheIndex::loadFromSnapshot(const std::string &filename) {
   for (uint64_t i = 0; i < count; i++) {
     uint32_t hash_len = 0;
     if (!read_all(&hash_len, sizeof(hash_len)) || hash_len > 4096) {
+      std::fprintf(stderr, "[light_mem warning] snapshot load: bad hash_len (file=%s)\n", filename.c_str());
       ::close(fd);
       return false;
     }
@@ -363,18 +396,21 @@ bool LocalCacheIndex::loadFromSnapshot(const std::string &filename) {
     std::string hash;
     hash.resize(hash_len);
     if (hash_len > 0 && !read_all(hash.data(), hash_len)) {
+      std::fprintf(stderr, "[light_mem warning] snapshot load: read hash failed (file=%s)\n", filename.c_str());
       ::close(fd);
       return false;
     }
 
     uint64_t slot_id = 0;
     if (!read_all(&slot_id, sizeof(slot_id))) {
+      std::fprintf(stderr, "[light_mem warning] snapshot load: read slot_id failed (file=%s)\n", filename.c_str());
       ::close(fd);
       return false;
     }
 
     uint32_t crc = 0;
     if (!read_all(&crc, sizeof(crc))) {
+      std::fprintf(stderr, "[light_mem warning] snapshot load: read crc failed (file=%s)\n", filename.c_str());
       ::close(fd);
       return false;
     }

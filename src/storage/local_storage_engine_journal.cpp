@@ -4,6 +4,7 @@
 
 #include "utils/fsync_compat.h"
 
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -108,7 +109,11 @@ void LocalStorageEngine::journalWorkerLoop(size_t shard_id) {
       if (queue_empty) {
         maybeCheckpoint(shard_id);
       }
+    } catch (const std::exception &e) {
+      std::fprintf(stderr, "[light_mem error] journalWorkerLoop: exception (shard=%zu): %s\n", shard_id, e.what());
+      ok = false;
     } catch (...) {
+      std::fprintf(stderr, "[light_mem error] journalWorkerLoop: unknown exception (shard=%zu)\n", shard_id);
       ok = false;
     }
 
@@ -169,33 +174,45 @@ void LocalStorageEngine::appendJournalRecord(size_t shard_id, uint64_t write_off
 
   off_t end = ::lseek(meta_fds_[shard_id], 0, SEEK_END);
   if (end < 0) {
-    throw std::runtime_error("Failed to seek meta file end");
+    const int err = errno;
+    throw std::runtime_error(std::string("Failed to seek meta file end, errno=") + std::to_string(err) +
+                             ", reason=" + std::string(::strerror(err)));
   }
 
   if (!pwriteAll(meta_fds_[shard_id], &rec, sizeof(JournalRecord), end)) {
-    throw std::runtime_error("Failed to append journal header");
+    const int err = errno;
+    throw std::runtime_error(std::string("Failed to append journal header, errno=") + std::to_string(err) +
+                             ", reason=" + std::string(::strerror(err)));
   }
   end += static_cast<off_t>(sizeof(JournalRecord));
 
   if (!hash.empty()) {
     if (!pwriteAll(meta_fds_[shard_id], hash.data(), hash.size(), end)) {
-      throw std::runtime_error("Failed to append journal hash");
+      const int err = errno;
+      throw std::runtime_error(std::string("Failed to append journal hash, errno=") + std::to_string(err) +
+                               ", reason=" + std::string(::strerror(err)));
     }
     end += static_cast<off_t>(hash.size());
   }
 
   if (!evicted_hash.empty()) {
     if (!pwriteAll(meta_fds_[shard_id], evicted_hash.data(), evicted_hash.size(), end)) {
-      throw std::runtime_error("Failed to append journal evicted_hash");
+      const int err = errno;
+      throw std::runtime_error(std::string("Failed to append journal evicted_hash, errno=") + std::to_string(err) +
+                               ", reason=" + std::string(::strerror(err)));
     }
     end += static_cast<off_t>(evicted_hash.size());
   }
 
   if (!pwriteAll(meta_fds_[shard_id], &record_crc, sizeof(uint32_t), end)) {
-    throw std::runtime_error("Failed to append journal crc");
+    const int err = errno;
+    throw std::runtime_error(std::string("Failed to append journal crc, errno=") + std::to_string(err) +
+                             ", reason=" + std::string(::strerror(err)));
   }
   if (cache::utils::fdatasync_compat(meta_fds_[shard_id]) != 0) {
-    throw std::runtime_error("Failed to fdatasync meta");
+    const int err = errno;
+    throw std::runtime_error(std::string("Failed to fdatasync meta, errno=") + std::to_string(err) +
+                             ", reason=" + std::string(::strerror(err)));
   }
 }
 
@@ -218,19 +235,27 @@ void LocalStorageEngine::appendEpochMarkerLocked(size_t shard_id, uint64_t epoch
 
   off_t end = ::lseek(meta_fds_[shard_id], 0, SEEK_END);
   if (end < 0) {
-    throw std::runtime_error("Failed to seek meta file end (epoch marker)");
+    const int err = errno;
+    throw std::runtime_error(std::string("Failed to seek meta file end (epoch marker), errno=") +
+                             std::to_string(err) + ", reason=" + std::string(::strerror(err)));
   }
 
   if (!pwriteAll(meta_fds_[shard_id], &rec, sizeof(JournalRecord), end)) {
-    throw std::runtime_error("Failed to append epoch marker");
+    const int err = errno;
+    throw std::runtime_error(std::string("Failed to append epoch marker, errno=") + std::to_string(err) +
+                             ", reason=" + std::string(::strerror(err)));
   }
   end += static_cast<off_t>(sizeof(JournalRecord));
 
   if (!pwriteAll(meta_fds_[shard_id], &record_crc, sizeof(uint32_t), end)) {
-    throw std::runtime_error("Failed to append epoch marker crc");
+    const int err = errno;
+    throw std::runtime_error(std::string("Failed to append epoch marker crc, errno=") + std::to_string(err) +
+                             ", reason=" + std::string(::strerror(err)));
   }
   if (cache::utils::fdatasync_compat(meta_fds_[shard_id]) != 0) {
-    throw std::runtime_error("Failed to fdatasync meta (epoch marker)");
+    const int err = errno;
+    throw std::runtime_error(std::string("Failed to fdatasync meta (epoch marker), errno=") + std::to_string(err) +
+                             ", reason=" + std::string(::strerror(err)));
   }
 }
 
@@ -296,6 +321,8 @@ void LocalStorageEngine::checkpoint(size_t shard_id) {
   }
 
   if (::ftruncate(meta_fds_[shard_id], META_HEADER_SIZE) != 0) {
+    std::fprintf(stderr, "[light_mem warning] checkpoint: ftruncate meta failed for shard %zu (errno=%d %s)\n",
+                 shard_id, errno, std::strerror(errno));
     return;
   }
   (void)::fsync(meta_fds_[shard_id]);
@@ -324,6 +351,8 @@ void LocalStorageEngine::truncateJournalToHeader(size_t shard_id) {
     return;
   }
   if (::ftruncate(meta_fds_[shard_id], META_HEADER_SIZE) != 0) {
+    std::fprintf(stderr, "[light_mem warning] truncateJournalToHeader: ftruncate failed for shard %zu (errno=%d %s)\n",
+                 shard_id, errno, std::strerror(errno));
     return;
   }
   (void)::fsync(meta_fds_[shard_id]);

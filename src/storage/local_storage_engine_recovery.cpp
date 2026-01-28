@@ -4,6 +4,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <sstream>
@@ -21,6 +22,7 @@ void LocalStorageEngine::recoverShardToRedis(size_t shard_id) {
   }
   RedisClient *redis = redisForShard(shard_id);
   if (!redis || !redis->connect()) {
+    std::fprintf(stderr, "[light_mem warning] recoverShardToRedis: Redis not reachable (shard=%zu)\n", shard_id);
     return;
   }
 
@@ -44,12 +46,20 @@ void LocalStorageEngine::recoverShardToRedis(size_t shard_id) {
 
     int fd = ::open(snap_path.c_str(), O_RDONLY);
     if (fd >= 0) {
+      bool warned_snapshot = false;
+      int last_errno = 0;
+      bool last_eof = false;
       auto read_all = [&](void *p, size_t n) -> bool {
         char *buf = static_cast<char *>(p);
         size_t left = n;
         while (left > 0) {
           ssize_t r = ::read(fd, buf, left);
-          if (r <= 0) {
+          if (r == 0) {
+            last_eof = true;
+            return false;
+          }
+          if (r < 0) {
+            last_errno = errno;
             return false;
           }
           buf += static_cast<size_t>(r);
@@ -66,19 +76,39 @@ void LocalStorageEngine::recoverShardToRedis(size_t shard_id) {
         for (uint64_t i = 0; i < count; i++) {
           uint32_t hash_len = 0;
           if (!read_all(&hash_len, sizeof(hash_len)) || hash_len > 4096) {
+            if (!warned_snapshot) {
+              std::fprintf(stderr, "[light_mem warning] recoverShardToRedis: snapshot truncated/corrupt (file=%s)\n",
+                           snap_path.c_str());
+              warned_snapshot = true;
+            }
             break;
           }
           std::string hash;
           hash.resize(hash_len);
           if (hash_len > 0 && !read_all(hash.data(), hash_len)) {
+            if (!warned_snapshot) {
+              std::fprintf(stderr, "[light_mem warning] recoverShardToRedis: snapshot truncated/corrupt (file=%s)\n",
+                           snap_path.c_str());
+              warned_snapshot = true;
+            }
             break;
           }
           uint64_t slot = 0;
           if (!read_all(&slot, sizeof(slot))) {
+            if (!warned_snapshot) {
+              std::fprintf(stderr, "[light_mem warning] recoverShardToRedis: snapshot truncated/corrupt (file=%s)\n",
+                           snap_path.c_str());
+              warned_snapshot = true;
+            }
             break;
           }
           uint32_t crc = 0;
           if (!read_all(&crc, sizeof(crc))) {
+            if (!warned_snapshot) {
+              std::fprintf(stderr, "[light_mem warning] recoverShardToRedis: snapshot truncated/corrupt (file=%s)\n",
+                           snap_path.c_str());
+              warned_snapshot = true;
+            }
             break;
           }
           if (slot < shard_capacity) {
@@ -87,8 +117,28 @@ void LocalStorageEngine::recoverShardToRedis(size_t shard_id) {
             crc_present.insert(hash);
           }
         }
+      } else {
+        // Header read failed or magic/version mismatch.
+        if (!warned_snapshot) {
+          if (last_eof) {
+            std::fprintf(stderr, "[light_mem warning] recoverShardToRedis: snapshot header truncated (file=%s)\n",
+                         snap_path.c_str());
+          } else if (last_errno != 0) {
+            std::fprintf(stderr,
+                         "[light_mem warning] recoverShardToRedis: snapshot header read failed (file=%s errno=%d %s)\n",
+                         snap_path.c_str(), last_errno, std::strerror(last_errno));
+          } else {
+            std::fprintf(stderr,
+                         "[light_mem warning] recoverShardToRedis: snapshot header mismatch (file=%s magic=0x%08x version=%u)\n",
+                         snap_path.c_str(), magic, version);
+          }
+          warned_snapshot = true;
+        }
       }
       ::close(fd);
+    } else if (errno != ENOENT) {
+      std::fprintf(stderr, "[light_mem warning] recoverShardToRedis: open snapshot failed (file=%s errno=%d %s)\n",
+                   snap_path.c_str(), errno, std::strerror(errno));
     }
   }
 
@@ -207,6 +257,8 @@ void LocalStorageEngine::recoverShardToRedisIncremental(size_t shard_id) {
   }
   RedisClient *redis = redisForShard(shard_id);
   if (!redis || !redis->connect()) {
+    std::fprintf(stderr, "[light_mem warning] recoverShardToRedisIncremental: Redis not reachable (shard=%zu)\n",
+                 shard_id);
     return;
   }
 
@@ -238,7 +290,10 @@ void LocalStorageEngine::recoverShardToRedisIncremental(size_t shard_id) {
   }
   cmds.push_back({"SET", redis->shardSeqKey(shard_id), std::to_string(superblock_seq_[shard_id])});
 
-  (void)redis->pipeline(cmds);
+  if (!redis->pipeline(cmds)) {
+    std::fprintf(stderr, "[light_mem warning] recoverShardToRedisIncremental: Redis pipeline failed (shard=%zu cmds=%zu)\n",
+                 shard_id, cmds.size());
+  }
 }
 
 void LocalStorageEngine::recoverShardToRedisSmart(size_t shard_id) {
@@ -253,19 +308,39 @@ void LocalStorageEngine::scanWalOps(size_t shard_id, size_t shard_capacity, off_
                                     std::vector<JournalOp> &ops) {
   struct stat st{};
   if (::fstat(meta_fds_[shard_id], &st) != 0) {
+    std::fprintf(stderr,
+                 "[light_mem warning] wal scan: fstat failed (shard=%zu fd=%d errno=%d %s)\n",
+                 shard_id, meta_fds_[shard_id], errno, std::strerror(errno));
     return;
   }
   const off_t end = st.st_size;
   off_t off = start_off;
 
   uint64_t max_epoch_seen = 0;
+  bool warned_io = false;
+  bool warned_crc = false;
+  bool warned_bad_record = false;
 
   while (off + static_cast<off_t>(sizeof(uint32_t)) <= end) {
+    const off_t record_start = off;
     uint32_t magic = 0;
     if (!preadAll(meta_fds_[shard_id], &magic, sizeof(uint32_t), off)) {
+      if (!warned_io) {
+        std::fprintf(stderr,
+                     "[light_mem warning] wal scan: read magic failed (shard=%zu off=%lld start=%lld end=%lld errno=%d %s)\n",
+                     shard_id, static_cast<long long>(off), static_cast<long long>(start_off),
+                     static_cast<long long>(end), errno, std::strerror(errno));
+        warned_io = true;
+      }
       break;
     }
     if (magic != JOURNAL_MAGIC) {
+      // Not necessarily an error: tail may contain junk/partial writes. Log only if this happens at the scan start.
+      if (off == start_off) {
+        std::fprintf(stderr,
+                     "[light_mem warning] wal scan: magic mismatch at start (shard=%zu off=%lld got=0x%08x expect=0x%08x)\n",
+                     shard_id, static_cast<long long>(off), magic, JOURNAL_MAGIC);
+      }
       break;
     }
 
@@ -318,6 +393,12 @@ void LocalStorageEngine::scanWalOps(size_t shard_id, size_t shard_capacity, off_
         }
         const uint32_t expect = compute_crc32(tmp.data(), tmp.size());
         if (expect != record_crc) {
+          if (!warned_crc) {
+            std::fprintf(stderr,
+                         "[light_mem warning] wal scan: record crc mismatch (shard=%zu off=%lld)\n",
+                         shard_id, static_cast<long long>(record_start));
+            warned_crc = true;
+          }
           parsed = true;
           continue;
         }
@@ -363,6 +444,13 @@ void LocalStorageEngine::scanWalOps(size_t shard_id, size_t shard_capacity, off_
     }
 
     // Not a valid record at this offset; stop scanning.
+    if (!warned_bad_record) {
+      std::fprintf(stderr,
+                   "[light_mem warning] wal scan: invalid record, stop scanning (shard=%zu off=%lld start=%lld end=%lld)\n",
+                   shard_id, static_cast<long long>(record_start), static_cast<long long>(start_off),
+                   static_cast<long long>(end));
+      warned_bad_record = true;
+    }
     break;
   }
 }
@@ -430,6 +518,8 @@ void LocalStorageEngine::recoverShard(size_t shard_id, size_t shard_capacity) {
     for (const auto &op : ops) {
       if (!op.evicted.empty()) {
         if (!redis->hdel(key, op.evicted)) {
+          std::fprintf(stderr, "[light_mem warning] recoverShard: Redis HDEL shard index failed (shard=%zu hash=%s)\n",
+                       shard_id, op.evicted.c_str());
           replay_ok = false;
           break;
         }
@@ -437,11 +527,15 @@ void LocalStorageEngine::recoverShard(size_t shard_id, size_t shard_capacity) {
         (void)redis->hdel(redis->globalCrcKey(), op.evicted);
       }
       if (!redis->hset(key, op.hash, std::to_string(op.slot_id))) {
+        std::fprintf(stderr, "[light_mem warning] recoverShard: Redis HSET shard index failed (shard=%zu hash=%s)\n",
+                     shard_id, op.hash.c_str());
         replay_ok = false;
         break;
       }
 
       if (!redis->hset(redis->globalCrcKey(), op.hash, std::to_string(op.data_crc))) {
+        std::fprintf(stderr, "[light_mem warning] recoverShard: Redis HSET crc failed (shard=%zu hash=%s)\n", shard_id,
+                     op.hash.c_str());
         replay_ok = false;
         break;
       }
@@ -451,6 +545,7 @@ void LocalStorageEngine::recoverShard(size_t shard_id, size_t shard_capacity) {
     }
     if (replay_ok) {
       if (!redis->setString(redis->shardSeqKey(shard_id), std::to_string(superblock_seq_[shard_id]))) {
+        std::fprintf(stderr, "[light_mem warning] recoverShard: Redis SET shard seq failed (shard=%zu)\n", shard_id);
         replay_ok = false;
       }
     }
