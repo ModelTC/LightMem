@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <list>
 #include <mutex>
 #include <string>
@@ -17,6 +18,8 @@ namespace storage {
  */
 class LocalCacheIndex {
 public:
+  using Hook = std::function<void(const std::string &hash)>;
+
   /**
    * @brief Internal structure to store LRU list iterator and exists call count
    */
@@ -33,6 +36,12 @@ public:
    * @param capacity Maximum number of hash values to store
    */
   explicit LocalCacheIndex(size_t capacity);
+
+  // Optional hooks:
+  // - on_ready: called (under index_lock_) when a hash becomes ready/readable.
+  // - on_erase: called (under index_lock_) right before a hash is removed/evicted.
+  // These are intended for maintaining auxiliary indices (e.g. hash->shard hints).
+  void set_hooks(Hook on_ready, Hook on_erase);
 
   void reset();
 
@@ -87,6 +96,9 @@ private:
   std::list<size_t> empty_block_list_;                ///< List of free disk blocks
   std::unordered_map<std::string, IndexEntry> index_; ///< Map from hash value to IndexEntry
   mutable std::mutex index_lock_;                     ///< Mutex protecting index data structures
+
+  Hook on_ready_;
+  Hook on_erase_;
 
   uint64_t eviction_count_{0};
 };

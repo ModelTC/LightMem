@@ -471,16 +471,7 @@ void LocalStorageEngine::recoverShard(size_t shard_id, size_t shard_capacity) {
   ss << filename_ << "_" << shard_id << "/index";
   std::string snap_path = ss.str();
   bool snapshot_loaded = caches_[shard_id]->loadFromSnapshot(snap_path);
-
-  // If snapshot is loaded, also warm up the local hash->shard hint map so distributed-mode
-  // reads/queries can locate the shard in O(1) without scanning all shards or hitting Redis.
-  if (snapshot_loaded && online_mode_) {
-    std::vector<std::string> hashes;
-    caches_[shard_id]->dump_ready(hashes);
-    for (const auto &hash : hashes) {
-      noteLocalShardHint(hash, shard_id);
-    }
-  }
+  (void)snapshot_loaded;
 
   // 1. Scan WAL
   // We rely SOLELY on Snapshot + WAL.
@@ -497,14 +488,8 @@ void LocalStorageEngine::recoverShard(size_t shard_id, size_t shard_capacity) {
     for (const auto &op : ops) {
       if (!op.evicted.empty()) {
         caches_[shard_id]->remove(op.evicted);
-        if (online_mode_) {
-          eraseLocalShardHint(op.evicted);
-        }
       }
       caches_[shard_id]->put_ready(op.hash, op.slot_id, op.data_crc);
-      if (online_mode_) {
-        noteLocalShardHint(op.hash, shard_id);
-      }
     }
   }
 

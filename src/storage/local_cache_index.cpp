@@ -27,8 +27,21 @@ LocalCacheIndex::LocalCacheIndex(size_t capacity) : capacity_(capacity) {
   }
 }
 
+void LocalCacheIndex::set_hooks(Hook on_ready, Hook on_erase) {
+  std::lock_guard<std::mutex> lock(index_lock_);
+  on_ready_ = std::move(on_ready);
+  on_erase_ = std::move(on_erase);
+}
+
 void LocalCacheIndex::reset() {
   std::lock_guard<std::mutex> lock(index_lock_);
+
+  if (on_erase_) {
+    for (const auto &kv : index_) {
+      on_erase_(kv.first);
+    }
+  }
+
   lru_list_.clear();
   index_.clear();
   empty_block_list_.clear();
@@ -53,12 +66,18 @@ void LocalCacheIndex::put_ready(const std::string &hash, size_t slot_id, uint32_
     it->second.writing = false;
     it->second.crc = crc;
     lru_list_.splice(lru_list_.begin(), lru_list_, it->second.lru_iterator);
+    if (on_ready_) {
+      on_ready_(hash);
+    }
     return;
   }
 
   // If slot is already used by someone else, evict that hash.
   for (auto map_it = index_.begin(); map_it != index_.end(); ++map_it) {
     if (map_it->second.slot_id == slot_id) {
+      if (on_erase_) {
+        on_erase_(map_it->first);
+      }
       lru_list_.erase(map_it->second.lru_iterator);
       index_.erase(map_it);
       break;
@@ -78,6 +97,9 @@ void LocalCacheIndex::put_ready(const std::string &hash, size_t slot_id, uint32_
     const std::string victim = lru_list_.back();
     auto vit = index_.find(victim);
     if (vit != index_.end()) {
+      if (on_erase_) {
+        on_erase_(victim);
+      }
       size_t freed = vit->second.slot_id;
       lru_list_.pop_back();
       index_.erase(vit);
@@ -87,6 +109,10 @@ void LocalCacheIndex::put_ready(const std::string &hash, size_t slot_id, uint32_
 
   lru_list_.push_front(hash);
   index_[hash] = {lru_list_.begin(), slot_id, true, false, crc};
+
+  if (on_ready_) {
+    on_ready_(hash);
+  }
 }
 
 bool LocalCacheIndex::exists(const std::string &hash) {
@@ -138,6 +164,11 @@ int LocalCacheIndex::acquire_slot(const std::string &hash, size_t &slot_id, std:
       if (!candidate_it->second.writing) {
         slot_id = candidate_it->second.slot_id;
         evicted_hash = candidate_hash;
+
+        if (on_erase_) {
+          on_erase_(candidate_hash);
+        }
+
         lru_list_.erase(it);
         index_.erase(candidate_it);
         eviction_count_++;
@@ -175,6 +206,10 @@ void LocalCacheIndex::mark_ready(const std::string &hash, uint32_t crc) {
     if (crc != 0) {
       it->second.crc = crc;
     }
+
+    if (on_ready_) {
+      on_ready_(hash);
+    }
   }
 }
 
@@ -182,6 +217,9 @@ void LocalCacheIndex::remove(const std::string &hash) {
   std::lock_guard<std::mutex> lock(index_lock_);
   auto it = index_.find(hash);
   if (it != index_.end()) {
+    if (on_erase_) {
+      on_erase_(hash);
+    }
     size_t slot_id = it->second.slot_id;
     lru_list_.erase(it->second.lru_iterator);
     index_.erase(it);

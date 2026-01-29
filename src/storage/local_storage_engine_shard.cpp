@@ -165,17 +165,6 @@ void LocalStorageEngine::updateShardAssignments(const std::vector<size_t> &shard
         caches_[sid]->reset();
       }
       shard_recovered_epoch_[sid] = 0;
-      for (size_t b = 0; b < kLocalHintBuckets; b++) {
-        std::unique_lock<std::shared_mutex> lk(local_hint_mu_[b]);
-        auto &bucket = local_hash_to_shard_[b];
-        for (auto it = bucket.begin(); it != bucket.end();) {
-          if (it->second == sid) {
-            it = bucket.erase(it);
-          } else {
-            ++it;
-          }
-        }
-      }
     }
 
     // In online mode, rebuild local index only for owned/writable shards when ownership changes.

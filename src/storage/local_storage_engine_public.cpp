@@ -111,6 +111,16 @@ LocalStorageEngine::LocalStorageEngine(const std::string &filename, const size_t
       journal_mu_[i] = std::make_unique<std::mutex>();
       journal_cv_[i] = std::make_unique<std::condition_variable>();
     }
+
+    // Make localShardHint authoritative: update hint under the same LocalCacheIndex mutex
+    // for any ready insertions and removals/evictions.
+    if (online_mode_) {
+      for (size_t i = 0; i < shard_; i++) {
+        caches_[i]->set_hooks(
+            [this, i](const std::string &hash) { noteLocalShardHint(hash, i); },
+            [this](const std::string &hash) { eraseLocalShardHint(hash); });
+      }
+    }
     createOrOpenFiles(shard_storage_size);
     if (!online_mode_) {
       recoverAllShards(shard_capacity);
@@ -154,31 +164,15 @@ bool LocalStorageEngine::query(const std::string &hash) {
     return caches_[shard_id]->exists(hash);
   }
 
-  // Best-effort hot path: if we already learned hash->shard locally and we still own that shard,
-  // validate via shard-local index and avoid Redis.
-  {
-    auto hinted = localShardHint(hash);
-    if (hinted.has_value() && hinted.value() < shard_) {
-      const size_t shard_id = hinted.value();
-      if (caches_[shard_id]->exists(hash)) {
-        return true;
-      } else {
-        // Stale hint (evicted locally).
-        eraseLocalShardHint(hash);
-      }
-    }
+  // Authoritative local hint: if present, the hash is readable on this node.
+  auto hinted = localShardHint(hash);
+  if (hinted.has_value() && hinted.value() < shard_) {
+    return true;
   }
 
-  // Distributed mode:
-  // - If Redis is configured, prefer the global index to avoid O(shards) scans.
-  // - If Redis is unavailable, fall back to scanning local in-memory indices.
+  // Distributed mode: prefer Redis global index.
   if (redis_lock_ && redis_lock_->connect()) {
     return redis_lock_->hexists(redis_lock_->globalIndexKey(), hash);
-  }
-  for (size_t i = 0; i < shard_; i++) {
-    if (caches_[i]->exists(hash)) {
-      return true;
-    }
   }
   return false;
 }
@@ -207,14 +201,8 @@ std::vector<bool> LocalStorageEngine::queryMany(const std::vector<std::string> &
     const std::string &hash = hashs[i];
     auto hinted = localShardHint(hash);
     if (hinted.has_value() && hinted.value() < shard_) {
-      const size_t shard_id = hinted.value();
-      if (caches_[shard_id]->exists(hash)) {
-        ret[i] = true;
-        continue;
-      } else {
-        // Stale hint (evicted locally).
-        eraseLocalShardHint(hash);
-      }
+      ret[i] = true;
+      continue;
     }
     need_redis_hash.emplace_back(hash);
     need_redis_idx.emplace_back(i);
@@ -225,7 +213,6 @@ std::vector<bool> LocalStorageEngine::queryMany(const std::vector<std::string> &
   }
 
   // Second pass: Redis global index (batched).
-  // We use HMGET to avoid per-hash RTT.
   if (redis_lock_ && redis_lock_->connect()) {
     auto vals = redis_lock_->hmget(redis_lock_->globalIndexKey(), need_redis_hash);
     if (vals.has_value() && vals->size() == need_redis_hash.size()) {
@@ -250,20 +237,8 @@ std::vector<bool> LocalStorageEngine::queryMany(const std::vector<std::string> &
       }
       return ret;
     }
-    // If Redis IO/parsing fails, fall through to local scan.
+    // If Redis IO/parsing fails, treat as miss (no local full-scan fallback).
   }
-
-  // Last resort: scan local in-memory indices.
-  for (size_t j = 0; j < need_redis_hash.size(); j++) {
-    const std::string &hash = need_redis_hash[j];
-    for (size_t sid = 0; sid < shard_; sid++) {
-      if (caches_[sid]->exists(hash)) {
-        ret[need_redis_idx[j]] = true;
-        break;
-      }
-    }
-  }
-
   return ret;
 }
 
@@ -329,11 +304,6 @@ size_t LocalStorageEngine::write(const char *buf, const std::string &hash) {
     return 0;
   }
 
-  // Maintain local hint bounds: if we evicted something, drop its hint.
-  if (!evicted_hash.empty()) {
-    eraseLocalShardHint(evicted_hash);
-  }
-
   // If LRU evicted something, delete its Redis mappings *before* we overwrite the slot.
   // This avoids a window where stale Redis mapping points to overwritten data.
   if (do_global_dedupe && !evicted_hash.empty()) {
@@ -371,7 +341,6 @@ size_t LocalStorageEngine::write(const char *buf, const std::string &hash) {
                  "[light_mem error] write: data I/O failed (shard=%zu hash=%s offset=%zu): %s\n",
                  shard_id, hash.c_str(), offset_bytes, e.what());
     caches_[shard_id]->remove(hash);
-    eraseLocalShardHint(hash);
     shard_inflight_[shard_id].fetch_sub(1, std::memory_order_relaxed);
     if (do_global_dedupe) {
       (void)redis_lock_->del(lock_key);
@@ -381,7 +350,6 @@ size_t LocalStorageEngine::write(const char *buf, const std::string &hash) {
     std::fprintf(stderr, "[light_mem error] write: data I/O failed (shard=%zu hash=%s offset=%zu): unknown error\n",
                  shard_id, hash.c_str(), offset_bytes);
     caches_[shard_id]->remove(hash);
-    eraseLocalShardHint(hash);
     shard_inflight_[shard_id].fetch_sub(1, std::memory_order_relaxed);
     if (do_global_dedupe) {
       (void)redis_lock_->del(lock_key);
@@ -393,7 +361,6 @@ size_t LocalStorageEngine::write(const char *buf, const std::string &hash) {
   uint64_t epoch2 = 0;
   if (!isShardWritable(shard_id, &epoch2) || epoch2 != epoch) {
     caches_[shard_id]->remove(hash);
-    eraseLocalShardHint(hash);
     shard_inflight_[shard_id].fetch_sub(1, std::memory_order_relaxed);
     if (do_global_dedupe) {
       (void)redis_lock_->del(lock_key);
@@ -426,7 +393,6 @@ size_t LocalStorageEngine::write(const char *buf, const std::string &hash) {
 
   if (!task->success) {
     caches_[shard_id]->remove(hash);
-    eraseLocalShardHint(hash);
     shard_inflight_[shard_id].fetch_sub(1, std::memory_order_relaxed);
     if (do_global_dedupe) {
       (void)redis_lock_->del(lock_key);
@@ -436,7 +402,6 @@ size_t LocalStorageEngine::write(const char *buf, const std::string &hash) {
 
   // Mark as ready only after the WAL commit finishes.
   caches_[shard_id]->mark_ready(hash, data_crc);
-  noteLocalShardHint(hash, shard_id);
 
   shard_written_bytes_[shard_id].fetch_add(static_cast<uint64_t>(block_size_), std::memory_order_relaxed);
 
@@ -469,7 +434,7 @@ size_t LocalStorageEngine::read(char *buf, const std::string &hash) {
     }
     crc_available = (expected_crc != 0);
   } else {
-    // 1) Local-first: try hint then (if needed) scan local indices.
+    // 1) Local-first: try authoritative hint.
     auto hinted = localShardHint(hash);
     if (hinted.has_value() && hinted.value() < shard_) {
       const size_t i = hinted.value();
@@ -483,25 +448,11 @@ size_t LocalStorageEngine::read(char *buf, const std::string &hash) {
       }
     }
 
-    if (shard_id == static_cast<size_t>(-1)) {
-      for (size_t i = 0; i < shard_; i++) {
-        const size_t off = caches_[i]->get_offset(hash);
-        if (off != static_cast<size_t>(-1)) {
-          shard_id = i;
-          slot_id = off;
-          local_hit = true;
-          noteLocalShardHint(hash, i);
-          break;
-        }
-      }
-    }
-
     // 2) Fallback: resolve via Redis global index.
     if (shard_id == static_cast<size_t>(-1) && redis_lock_ && redis_lock_->connect()) {
       auto resolved = findShardInRedis(hash, &slot_id);
       if (resolved.has_value()) {
         shard_id = *resolved;
-        noteLocalShardHint(hash, shard_id);
         redis_hit = true;
       }
     }
@@ -523,7 +474,6 @@ size_t LocalStorageEngine::read(char *buf, const std::string &hash) {
       eraseLocalShardHint(hash);
       return 0;
     }
-    noteLocalShardHint(hash, shard_id);
     const size_t offset_bytes = slot_id * block_size_;
     if (file_fds_[shard_id] < 0) {
       return 0;
@@ -583,7 +533,6 @@ size_t LocalStorageEngine::read(char *buf, const std::string &hash) {
     const uint32_t got_crc = compute_crc32(buf, block_size_);
     if (got_crc != expected_crc) {
       caches_[shard_id]->remove(hash);
-      eraseLocalShardHint(hash);
       return 0;
     }
   }
@@ -597,11 +546,9 @@ size_t LocalStorageEngine::read(char *buf, const std::string &hash) {
       (void)redis_lock_->hdel(redis_lock_->shardIndexKey(shard_id), hash);
       (void)redis_lock_->hdel(redis_lock_->globalCrcKey(), hash);
       caches_[shard_id]->remove(hash);
-      eraseLocalShardHint(hash);
       return 0;
     }
     caches_[shard_id]->put_ready(hash, slot_id, expected_crc);
-    noteLocalShardHint(hash, shard_id);
   }
   return block_size_;
 }
