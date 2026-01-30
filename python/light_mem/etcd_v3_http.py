@@ -266,35 +266,20 @@ class EtcdV3HttpClient:
             raise RuntimeError(f"etcd lease keepalive returned invalid TTL: {msg}")
         return EtcdLease(id=int(lease_id), ttl=int(ttl))
 
-    def get(self, key: str) -> Tuple[Optional[bytes], Optional[EtcdMeta]]:
-        k = key.encode("utf-8")
-        out = self._post_json("/v3/kv/range", {"key": _b64e(k), "limit": 1})
-        kvs = out.get("kvs") or []
-        if not kvs:
-            return None, None
-        kv = kvs[0]
-        try:
-            meta = EtcdMeta(
-                key=_b64d(kv.get("key", "")),
-                create_revision=int(kv.get("create_revision", 0) or 0),
-                mod_revision=int(kv.get("mod_revision", 0) or 0),
-                version=int(kv.get("version", 0) or 0),
-            )
-            v = _b64d(kv.get("value", "")) if kv.get("value") is not None else None
-        except Exception:
-            return None, None
-        return v, meta
+    def _range(
+        self,
+        *,
+        key: bytes,
+        range_end: Optional[bytes] = None,
+        limit: Optional[int] = None,
+    ) -> Iterator[Tuple[Optional[bytes], EtcdMeta]]:
+        payload: dict = {"key": _b64e(bytes(key))}
+        if range_end is not None:
+            payload["range_end"] = _b64e(bytes(range_end))
+        if limit is not None:
+            payload["limit"] = int(limit)
 
-    def get_prefix(self, prefix: str) -> Iterator[Tuple[Optional[bytes], EtcdMeta]]:
-        p = prefix.encode("utf-8")
-        range_end = _prefix_range_end(p)
-        out = self._post_json(
-            "/v3/kv/range",
-            {
-                "key": _b64e(p),
-                "range_end": _b64e(range_end),
-            },
-        )
+        out = self._post_json("/v3/kv/range", payload)
         for kv in out.get("kvs") or []:
             try:
                 meta = EtcdMeta(
@@ -307,6 +292,17 @@ class EtcdV3HttpClient:
             except Exception:
                 continue
             yield v, meta
+
+    def get(self, key: str) -> Tuple[Optional[bytes], Optional[EtcdMeta]]:
+        k = key.encode("utf-8")
+        for v, meta in self._range(key=k, limit=1):
+            return v, meta
+        return None, None
+
+    def get_prefix(self, prefix: str) -> Iterator[Tuple[Optional[bytes], EtcdMeta]]:
+        p = prefix.encode("utf-8")
+        range_end = _prefix_range_end(p)
+        yield from self._range(key=p, range_end=range_end)
 
     def put(self, key: str, value: str, *, lease=None) -> None:
         lease_id = 0

@@ -52,7 +52,7 @@ class EtcdShardCoordinator(threading.Thread):
 
     Keys (under prefix):
       - nodes/{node_id}              (lease-bound)
-      - shards/{sid}/state           (FREE|CLAIMED|DRAINING|SEALED)
+      - shards/{sid}/state           (FREE|CLAIMED|DRAINING)
       - shards/{sid}/owner           (node_id, lease-bound)
       - shards/{sid}/handoff_to      (node_id)  # request old owner to drain/release
 
@@ -111,16 +111,11 @@ class EtcdShardCoordinator(threading.Thread):
     def _ensure_state(self, client, sid: int) -> None:
         state_key = self._k(f"shards/{sid}/state")
         # Create default state FREE if absent
-        txn = client.transaction(
+        client.transaction(
             compare=[client.transactions.create(state_key) == 0],
             success=[client.transactions.put(state_key, "FREE")],
             failure=[],
         )
-        try:
-            txn
-        except Exception:
-            # Best-effort; if it fails, next reconcile will retry.
-            return
 
     def _get_nodes(self, client) -> List[str]:
         prefix = self._nodes_prefix()
@@ -186,7 +181,7 @@ class EtcdShardCoordinator(threading.Thread):
         newly_claimed: List[int] = []
 
         for sid in range(self._num_shards):
-            desired = self._assignment.get(sid) or self._desired_owner(nodes, sid)
+            desired = self._assignment.get(sid)
 
             state_key = self._k(f"shards/{sid}/state")
             owner_key = self._k(f"shards/{sid}/owner")
@@ -198,12 +193,6 @@ class EtcdShardCoordinator(threading.Thread):
                 self._ensure_state(client, sid)
                 state = self._get_text(client, state_key)
             state = state or "FREE"
-
-            if state == "SEALED":
-                # never writable
-                self._owned_epoch.pop(sid, None)
-                self._draining.pop(sid, None)
-                continue
 
             owner = self._get_text(client, owner_key)
             handoff_to = self._get_text(client, handoff_key)
@@ -310,11 +299,10 @@ class EtcdShardCoordinator(threading.Thread):
         state_key = self._k(f"shards/{sid}/state")
         handoff_key = self._k(f"shards/{sid}/handoff_to")
 
-        # Only claim if no owner and not SEALED.
+        # Only claim if no owner.
         txn_ok, _ = client.transaction(
             compare=[
                 client.transactions.create(owner_key) == 0,
-                client.transactions.value(state_key) != b"SEALED",
             ],
             success=[
                 client.transactions.put(owner_key, self._opt.node_id, lease=lease),
@@ -488,7 +476,10 @@ class EtcdShardCoordinator(threading.Thread):
 #
 # Without this, different nodes may operate on different shard id ranges,
 # leading to inconsistent ownership keys and unsafe writes.
-def _ensure_cluster_num_shards(client, *, prefix: str, expected: int) -> None:
+def _ensure_cluster_num_shards(endpoints: str, prefix: str, expected: int) -> None:
+    host, port = _parse_endpoints(endpoints)
+    client = EtcdV3HttpClient(host=host, port=port)
+
     key = f"{prefix.rstrip('/')}/config/num_shards"
 
     # First node wins by creating the key. Others validate it matches.
@@ -540,9 +531,7 @@ def maybe_start_etcd_coordinator(
     ttl = int(coord_ttl)
     interval = float(coord_reconcile_sec)
 
-    host, port = _parse_endpoints(endpoints)
-    client = EtcdV3HttpClient(host=host, port=port)
-    _ensure_cluster_num_shards(client, prefix=prefix, expected=int(num_shards))
+    _ensure_cluster_num_shards(endpoints=endpoints, prefix=prefix, expected=int(num_shards))
 
     opt = EtcdOptions(
         endpoints=endpoints,
