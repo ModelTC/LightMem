@@ -55,11 +55,9 @@ public:
                      const std::string &index_endpoint, const std::string &index_prefix = std::string());
   ~LocalStorageEngine() override;
 
-  bool query(const std::string &hash) override;
-
   // Batch query variant for high-throughput callers.
   // Returns one bool per hash (same order). In online mode this answers "readable on this node".
-  std::vector<bool> queryMany(const std::vector<std::string> &hashs);
+  std::vector<bool> queryMany(const std::vector<std::string> &hashs) override;
   size_t write(const char *buf, const std::string &hash) override;
   size_t read(char *buf, const std::string &hash) override;
 
@@ -81,8 +79,11 @@ public:
   // This is a best-effort optimization; correctness is still guarded by CRC checks.
   void recoverShardToRedisSmart(size_t shard_id);
 
-  // Observability: number of in-flight write operations targeting a shard.
-  // This is best-effort and intended for control-plane decisions (e.g., waiting for draining).
+  // Observability: number of in-flight operations targeting a shard.
+  // This includes:
+  // - write operations
+  // - online-mode local-hit fast-path reads (that bypass Redis+CRC)
+  // It is best-effort and intended for control-plane decisions (e.g., waiting for draining).
   uint32_t shardInflight(size_t shard_id) const;
   uint64_t shardWrittenBytes(size_t shard_id) const;
 
@@ -103,9 +104,53 @@ private:
   std::optional<size_t> findShardInRedis(const std::string &hash, size_t *slot_id_out);
   size_t pickWritableShard(const std::string &hash) const;
 
+  struct InflightCounter {
+    struct Guard {
+      explicit Guard(std::atomic<uint32_t> *ctr) : ctr_(ctr), active_(ctr != nullptr) {
+        if (active_) {
+          ctr_->fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+
+      Guard(const Guard &) = delete;
+      Guard &operator=(const Guard &) = delete;
+
+      Guard(Guard &&other) noexcept : ctr_(other.ctr_), active_(other.active_) {
+        other.ctr_ = nullptr;
+        other.active_ = false;
+      }
+      Guard &operator=(Guard &&) = delete;
+
+      ~Guard() {
+        if (active_ && ctr_) {
+          ctr_->fetch_sub(1, std::memory_order_relaxed);
+        }
+      }
+
+    private:
+      std::atomic<uint32_t> *ctr_;
+      bool active_;
+    };
+
+    Guard acquire() const { return Guard(&ctr_); }
+    uint32_t load(std::memory_order order) const { return ctr_.load(order); }
+    void store(uint32_t v, std::memory_order order) { ctr_.store(v, order); }
+
+  private:
+    mutable std::atomic<uint32_t> ctr_{0};
+  };
+
   // Best-effort local hint to avoid O(shards) scans and repeated Redis lookups.
   // Only used in online_mode_ and always re-validated under the shard io lock.
-  std::optional<size_t> localShardHint(const std::string &hash) const;
+  struct LocalShardHintHit {
+    size_t shard_id;
+    InflightCounter::Guard inflight_guard;
+  };
+
+  // Returns a shard-local hint plus an inflight guard.
+  // Holding the returned guard keeps shardInflight(shard_id) > 0, so shard handoff waits for
+  // any local-hit read that is about to proceed.
+  std::optional<LocalShardHintHit> localShardHint(const std::string &hash) const;
   void noteLocalShardHint(const std::string &hash, size_t shard_id);
   void eraseLocalShardHint(const std::string &hash);
 
@@ -179,7 +224,7 @@ private:
   std::unique_ptr<std::atomic<uint8_t>[]> shard_writable_;
   std::unique_ptr<std::atomic<uint8_t>[]> shard_draining_;
   std::unique_ptr<std::atomic<uint64_t>[]> shard_epoch_cache_;
-  std::unique_ptr<std::atomic<uint32_t>[]> shard_inflight_;
+  std::unique_ptr<InflightCounter[]> shard_inflight_;
   std::unique_ptr<std::atomic<uint64_t>[]> shard_written_bytes_;
 
   std::vector<std::thread> journal_threads_;

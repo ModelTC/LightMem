@@ -17,17 +17,50 @@
 namespace cache {
 namespace storage {
 
-std::optional<size_t> LocalStorageEngine::localShardHint(const std::string &hash) const {
+std::optional<LocalStorageEngine::LocalShardHintHit> LocalStorageEngine::localShardHint(const std::string &hash) const {
+  if (!online_mode_) {
+    std::fprintf(stderr, "[light_mem error] localShardHint called in offline mode\n");
+    return std::nullopt;
+  }
+
   const size_t b = localHintBucket(hash);
   std::shared_lock<std::shared_mutex> lk(local_hint_mu_[b]);
   auto it = local_hash_to_shard_[b].find(hash);
   if (it == local_hash_to_shard_[b].end()) {
     return std::nullopt;
   }
-  return it->second;
+  const size_t shard_id = it->second;
+  if (shard_id >= shard_) {
+    return std::nullopt;
+  }
+
+  // Acquire inflight inside localShardHint(). This closes the window between a successful hint
+  // check and the caller starting the local-hit read path.
+  auto inflight_guard = shard_inflight_[shard_id].acquire();
+
+  // In online mode, a shard in draining state is treated as not eligible for local-hit fast path.
+  // Re-check after acquiring inflight to avoid returning a hint during/after handoff.
+  if (!isShardWritable(shard_id, nullptr)) {
+    return std::nullopt;
+  }
+
+  return LocalShardHintHit{shard_id, std::move(inflight_guard)};
 }
 
 void LocalStorageEngine::noteLocalShardHint(const std::string &hash, size_t shard_id) {
+  if (!online_mode_) {
+    std::fprintf(stderr, "[light_mem error] noteLocalShardHint called in offline mode\n");
+    return;
+  }
+
+  if (shard_id >= shard_) {
+    return;
+  }
+  // Only record hints for shards eligible for local-hit fast path.
+  if (!isShardWritable(shard_id, nullptr)) {
+    return;
+  }
+
   // Fast-path: avoid exclusive lock when the mapping is already up-to-date.
   const size_t b = localHintBucket(hash);
   {
@@ -42,6 +75,11 @@ void LocalStorageEngine::noteLocalShardHint(const std::string &hash, size_t shar
 }
 
 void LocalStorageEngine::eraseLocalShardHint(const std::string &hash) {
+  if (!online_mode_) {
+    std::fprintf(stderr, "[light_mem error] eraseLocalShardHint called in offline mode\n");
+    return;
+  }
+
   // Fast-path: avoid exclusive lock if the key is absent.
   const size_t b = localHintBucket(hash);
   {
@@ -77,7 +115,7 @@ LocalStorageEngine::LocalStorageEngine(const std::string &filename, const size_t
   shard_writable_ = std::make_unique<std::atomic<uint8_t>[]>(shard_);
   shard_draining_ = std::make_unique<std::atomic<uint8_t>[]>(shard_);
   shard_epoch_cache_ = std::make_unique<std::atomic<uint64_t>[]>(shard_);
-  shard_inflight_ = std::make_unique<std::atomic<uint32_t>[]>(shard_);
+  shard_inflight_ = std::make_unique<InflightCounter[]>(shard_);
   shard_written_bytes_ = std::make_unique<std::atomic<uint64_t>[]>(shard_);
   for (size_t i = 0; i < shard_; i++) {
     shard_writable_[i].store(1, std::memory_order_relaxed);
@@ -158,25 +196,6 @@ LocalStorageEngine::~LocalStorageEngine() {
   cleanup();
 }
 
-bool LocalStorageEngine::query(const std::string &hash) {
-  if (!online_mode_) {
-    const size_t shard_id = getShard(hash);
-    return caches_[shard_id]->exists(hash);
-  }
-
-  // Authoritative local hint: if present, the hash is readable on this node.
-  auto hinted = localShardHint(hash);
-  if (hinted.has_value() && hinted.value() < shard_) {
-    return true;
-  }
-
-  // Distributed mode: prefer Redis global index.
-  if (redis_lock_ && redis_lock_->connect()) {
-    return redis_lock_->hexists(redis_lock_->globalIndexKey(), hash);
-  }
-  return false;
-}
-
 std::vector<bool> LocalStorageEngine::queryMany(const std::vector<std::string> &hashs) {
   std::vector<bool> ret;
   ret.assign(hashs.size(), false);
@@ -199,10 +218,13 @@ std::vector<bool> LocalStorageEngine::queryMany(const std::vector<std::string> &
 
   for (size_t i = 0; i < hashs.size(); i++) {
     const std::string &hash = hashs[i];
-    auto hinted = localShardHint(hash);
-    if (hinted.has_value() && hinted.value() < shard_) {
-      ret[i] = true;
-      continue;
+    if (auto hinted = localShardHint(hash); hinted.has_value() && hinted->shard_id < shard_) {
+      const size_t sid = hinted->shard_id;
+      if (sid < shard_ && caches_[sid] && caches_[sid]->exists(hash)) {
+        ret[i] = true;
+        continue;
+      }
+      eraseLocalShardHint(hash);
     }
     need_redis_hash.emplace_back(hash);
     need_redis_idx.emplace_back(i);
@@ -281,6 +303,7 @@ size_t LocalStorageEngine::write(const char *buf, const std::string &hash) {
     return 0;
   }
 
+  auto inflight_guard = shard_inflight_[shard_id].acquire();
   uint64_t epoch = 0;
   if (!isShardWritable(shard_id, &epoch)) {
     if (do_global_dedupe) {
@@ -289,15 +312,12 @@ size_t LocalStorageEngine::write(const char *buf, const std::string &hash) {
     return 0;
   }
 
-  shard_inflight_[shard_id].fetch_add(1, std::memory_order_relaxed);
-
   size_t slot_id = 0;
   std::string evicted_hash;
 
   // 1. Acquire slot (LRU)
   int result = caches_[shard_id]->acquire_slot(hash, slot_id, evicted_hash);
   if (result < 0) {
-    shard_inflight_[shard_id].fetch_sub(1, std::memory_order_relaxed);
     if (do_global_dedupe) {
       (void)redis_lock_->del(lock_key);
     }
@@ -341,7 +361,6 @@ size_t LocalStorageEngine::write(const char *buf, const std::string &hash) {
                  "[light_mem error] write: data I/O failed (shard=%zu hash=%s offset=%zu): %s\n",
                  shard_id, hash.c_str(), offset_bytes, e.what());
     caches_[shard_id]->remove(hash);
-    shard_inflight_[shard_id].fetch_sub(1, std::memory_order_relaxed);
     if (do_global_dedupe) {
       (void)redis_lock_->del(lock_key);
     }
@@ -350,7 +369,6 @@ size_t LocalStorageEngine::write(const char *buf, const std::string &hash) {
     std::fprintf(stderr, "[light_mem error] write: data I/O failed (shard=%zu hash=%s offset=%zu): unknown error\n",
                  shard_id, hash.c_str(), offset_bytes);
     caches_[shard_id]->remove(hash);
-    shard_inflight_[shard_id].fetch_sub(1, std::memory_order_relaxed);
     if (do_global_dedupe) {
       (void)redis_lock_->del(lock_key);
     }
@@ -361,7 +379,6 @@ size_t LocalStorageEngine::write(const char *buf, const std::string &hash) {
   uint64_t epoch2 = 0;
   if (!isShardWritable(shard_id, &epoch2) || epoch2 != epoch) {
     caches_[shard_id]->remove(hash);
-    shard_inflight_[shard_id].fetch_sub(1, std::memory_order_relaxed);
     if (do_global_dedupe) {
       (void)redis_lock_->del(lock_key);
     }
@@ -393,7 +410,6 @@ size_t LocalStorageEngine::write(const char *buf, const std::string &hash) {
 
   if (!task->success) {
     caches_[shard_id]->remove(hash);
-    shard_inflight_[shard_id].fetch_sub(1, std::memory_order_relaxed);
     if (do_global_dedupe) {
       (void)redis_lock_->del(lock_key);
     }
@@ -404,8 +420,6 @@ size_t LocalStorageEngine::write(const char *buf, const std::string &hash) {
   caches_[shard_id]->mark_ready(hash, data_crc);
 
   shard_written_bytes_[shard_id].fetch_add(static_cast<uint64_t>(block_size_), std::memory_order_relaxed);
-
-  shard_inflight_[shard_id].fetch_sub(1, std::memory_order_relaxed);
   if (do_global_dedupe) {
     (void)redis_lock_->del(lock_key);
   }
@@ -420,137 +434,103 @@ size_t LocalStorageEngine::write(const char *buf, const std::string &hash) {
 }
 
 size_t LocalStorageEngine::read(char *buf, const std::string &hash) {
-  size_t shard_id = static_cast<size_t>(-1);
-  size_t slot_id = static_cast<size_t>(-1);
-  bool local_hit = false;
-  bool redis_hit = false;
-  bool crc_available = false;
-  uint32_t expected_crc = 0;
-
   if (!online_mode_) {
-    shard_id = getShard(hash);
-    if (!caches_[shard_id]->get_offset_and_crc(hash, slot_id, expected_crc)) {
+    auto shard_id = getShard(hash);
+    auto slot_id = caches_[shard_id]->get_offset(hash);
+    if (slot_id == static_cast<size_t>(-1)) {
       return 0;
     }
-    crc_available = (expected_crc != 0);
-  } else {
-    // 1) Local-first: try authoritative hint.
-    auto hinted = localShardHint(hash);
-    if (hinted.has_value() && hinted.value() < shard_) {
-      const size_t i = hinted.value();
-      const size_t off = caches_[i]->get_offset(hash);
-      if (off != static_cast<size_t>(-1)) {
-        shard_id = i;
-        slot_id = off;
-        local_hit = true;
-      } else {
-        eraseLocalShardHint(hash);
-      }
+    if (file_fds_[shard_id] < 0) {
+      return 0;
     }
 
-    // 2) Fallback: resolve via Redis global index.
-    if (shard_id == static_cast<size_t>(-1) && redis_lock_ && redis_lock_->connect()) {
-      auto resolved = findShardInRedis(hash, &slot_id);
-      if (resolved.has_value()) {
-        shard_id = *resolved;
-        redis_hit = true;
+    {
+      std::shared_lock<std::shared_mutex> lock(*io_locks_[shard_id]);
+      const size_t slot_local = caches_[shard_id]->get_offset(hash);
+      if (slot_local != slot_id) {
+        return 0;
       }
+      const size_t offset_bytes = slot_id * block_size_;
+      if (!preadAll(file_fds_[shard_id], buf, block_size_, static_cast<off_t>(offset_bytes))) {
+        std::fprintf(stderr, "[light_mem error] read: I/O error for hash %s at offset %zu\n", hash.c_str(),
+                     offset_bytes);
+        return 0;
+      }
+    }
+    return block_size_;
+  }
+
+  // Online mode:
+  // 1) Local-hit path (authoritative local hint). Behaves like offline mode: read locally and return.
+  // local hits do NOT require CRC validation.
+  if (auto hinted = localShardHint(hash); hinted.has_value() && hinted->shard_id < shard_) {
+    const size_t i = hinted->shard_id;
+    std::shared_lock<std::shared_mutex> lock(*io_locks_[i]);
+    const size_t slot_id = caches_[i]->get_offset(hash);
+    if (slot_id != static_cast<size_t>(-1)) {
+      if (file_fds_[i] < 0) {
+        return 0;
+      }
+      const size_t offset_bytes = slot_id * block_size_;
+      if (!preadAll(file_fds_[i], buf, block_size_, static_cast<off_t>(offset_bytes))) {
+        std::fprintf(stderr, "[light_mem error] read: I/O error for hash %s at offset %zu\n", hash.c_str(), offset_bytes);
+        return 0;
+      }
+      return block_size_;
+    }
+    eraseLocalShardHint(hash);
+  }
+
+  // 2) Redis-resolved path (with CRC validation).
+  size_t shard_id = static_cast<size_t>(-1);
+  size_t slot_id = static_cast<size_t>(-1);
+  uint32_t expected_crc = 0;
+
+  if (redis_lock_ && redis_lock_->connect()) {
+    auto resolved = findShardInRedis(hash, &slot_id);
+    if (resolved.has_value()) {
+      shard_id = *resolved;
     }
   }
 
   if (shard_id == static_cast<size_t>(-1) || slot_id == static_cast<size_t>(-1)) {
     return 0;
   }
-
-  std::shared_lock<std::shared_mutex> lock(*io_locks_[shard_id]);
-
-  // Owner-local fast path (online/distributed mode):
-  // If the mapping is from our local in-memory index AND we currently own the shard,
-  // then no other node is allowed to overwrite slots in this shard.
-  // With the shard io lock held, re-check the local offset to avoid races with local eviction.
-  if (online_mode_ && local_hit) {
-    const size_t slot_local = caches_[shard_id]->get_offset(hash);
-    if (slot_local != slot_id) {
-      eraseLocalShardHint(hash);
-      return 0;
-    }
-    const size_t offset_bytes = slot_id * block_size_;
-    if (file_fds_[shard_id] < 0) {
-      return 0;
-    }
-    if (!preadAll(file_fds_[shard_id], buf, block_size_, static_cast<off_t>(offset_bytes))) {
-      std::fprintf(stderr, "[light_mem error] read: I/O error for hash %s at offset %zu\n", hash.c_str(),
-                   offset_bytes);
-      return 0;
-    }
-    return block_size_;
+  if (file_fds_[shard_id] < 0 || shard_id >= shard_) {
+    return 0;
   }
 
-  // If mapping came from Redis (or Redis is available), re-check it after taking the shard lock.
-  // This prevents returning wrong data if the owner evicted/overwrote the slot between lookup and read.
+  // Online mode correctness for Redis-resolved reads (or reads while shard is not writable / draining): verify CRC.
+  bool crc_available = false;
   if (redis_lock_ && redis_lock_->connect()) {
-    size_t slot2 = static_cast<size_t>(-1);
-    auto shard2 = findShardInRedis(hash, &slot2);
-    if (!shard2.has_value() || *shard2 != shard_id || slot2 != slot_id) {
-      return 0;
-    }
-  }
-
-  // If Redis was used to resolve, require CRC to be present before reading data.
-  if (redis_hit && redis_lock_ && redis_lock_->connect()) {
     auto crc_s = redis_lock_->hget(redis_lock_->globalCrcKey(), hash);
-    if (!crc_s.has_value() || crc_s->empty()) {
-      (void)redis_lock_->hdel(redis_lock_->globalIndexKey(), hash);
-      (void)redis_lock_->hdel(redis_lock_->shardIndexKey(shard_id), hash);
-      (void)redis_lock_->hdel(redis_lock_->globalCrcKey(), hash);
-      return 0;
-    }
-    try {
-      expected_crc = static_cast<uint32_t>(std::stoul(*crc_s));
-      crc_available = true;
-    } catch (...) {
-      (void)redis_lock_->hdel(redis_lock_->globalIndexKey(), hash);
-      (void)redis_lock_->hdel(redis_lock_->shardIndexKey(shard_id), hash);
-      (void)redis_lock_->hdel(redis_lock_->globalCrcKey(), hash);
-      return 0;
+    if (crc_s.has_value() && !crc_s->empty()) {
+      try {
+        expected_crc = static_cast<uint32_t>(std::stoul(*crc_s));
+        crc_available = (expected_crc != 0);
+      } catch (...) {
+        crc_available = false;
+      }
     }
   }
 
-  const size_t offset_bytes = slot_id * block_size_;
-  if (file_fds_[shard_id] < 0) {
-    return 0;
-  }
-  if (!preadAll(file_fds_[shard_id], buf, block_size_, static_cast<off_t>(offset_bytes))) {
-    std::fprintf(stderr, "[light_mem error] read: I/O error for hash %s at offset %zu\n", hash.c_str(), offset_bytes);
-    return 0;
-  }
-
-  // Local (offline) correctness: guard against a narrow TOCTOU window where a slot can be evicted
-  // and reused between index lookup and the actual I/O. In offline mode we don't have Redis to
-  // re-validate mapping, so use the locally recorded CRC (written at commit time) as a cheap
-  // correctness check.
-  if (!online_mode_ && crc_available) {
+  if (crc_available) {
+    const size_t offset_bytes = slot_id * block_size_;
+    if (!preadAll(file_fds_[shard_id], buf, block_size_, static_cast<off_t>(offset_bytes))) {
+      std::fprintf(stderr, "[light_mem error] read: I/O error for hash %s at offset %zu\n", hash.c_str(), offset_bytes);
+      return 0;
+    }
     const uint32_t got_crc = compute_crc32(buf, block_size_);
-    if (got_crc != expected_crc) {
-      caches_[shard_id]->remove(hash);
-      return 0;
+    if (got_crc == expected_crc) {
+      return block_size_;
     }
   }
-
-  // CRC verification for Redis-resolved reads.
-  if (redis_hit && crc_available) {
-    const uint32_t got_crc = compute_crc32(buf, block_size_);
-    if (got_crc != expected_crc) {
-      // Stale Redis mapping: delete best-effort and return miss.
-      (void)redis_lock_->hdel(redis_lock_->globalIndexKey(), hash);
-      (void)redis_lock_->hdel(redis_lock_->shardIndexKey(shard_id), hash);
-      (void)redis_lock_->hdel(redis_lock_->globalCrcKey(), hash);
-      caches_[shard_id]->remove(hash);
-      return 0;
-    }
-    caches_[shard_id]->put_ready(hash, slot_id, expected_crc);
+  if (redis_lock_ && redis_lock_->connect()) {
+    (void)redis_lock_->hdel(redis_lock_->globalIndexKey(), hash);
+    (void)redis_lock_->hdel(redis_lock_->shardIndexKey(shard_id), hash);
+    (void)redis_lock_->hdel(redis_lock_->globalCrcKey(), hash);
   }
-  return block_size_;
+  return 0;
 }
 
 std::shared_ptr<LocalStorageEngine::HashInfo> LocalStorageEngine::getHashInfo() {

@@ -460,7 +460,6 @@ private:
     // 2. Temporary failure (all slots busy, I/O error)
     // 3. Write was skipped
     // This is acceptable for cache operations - treat as success to avoid abort
-
     if (written == block_size_) {
       total_written_bytes_.fetch_add(static_cast<uint64_t>(written), std::memory_order_relaxed);
     }
@@ -494,8 +493,7 @@ private:
     const int64_t page_bytes = page_size;
 
     // Fast path: if destination pages are contiguous in memory and indices form a contiguous range,
-    // we can copy the entire span in one memcpy. This is the common case for benchmarks using
-    // kv_page_indexer=torch.arange(...).
+    // we can copy the entire span in one memcpy.
     if (num_of_page > 0 && page_stride == page_bytes) {
       const int32_t first = page_idx[0];
       if (first < 0 || first >= total_pages) {

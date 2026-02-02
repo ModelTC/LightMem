@@ -63,7 +63,7 @@ class EtcdShardCoordinator(threading.Thread):
 
     Delayed handoff:
       - old owner sets draining=1 locally when it sees handoff_to != self or desired owner changed
-      - coordinator waits until C++ reports inflight==0 before deleting owner key
+      - coordinator waits until C++ reports inflight==0 (writes + online local-hit reads) before deleting owner key
     """
 
     def __init__(self, service, num_shards: int, opt: EtcdOptions):
@@ -336,7 +336,7 @@ class EtcdShardCoordinator(threading.Thread):
         owner_key = self._k(f"shards/{sid}/owner")
         state_key = self._k(f"shards/{sid}/state")
 
-        # Only release if no inflight writes.
+        # Only release if no inflight operations (writes + online local-hit reads).
         inflight = int(self._svc.shard_inflight(int(sid)))
         if inflight != 0:
             return
