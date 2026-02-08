@@ -82,8 +82,6 @@ void LocalStorageEngine::journalWorkerLoop(size_t shard_id) {
         for (auto &task : batch) {
           if (!task->evicted_hash.empty()) {
             cmds.push_back({"HDEL", key, task->evicted_hash});
-            cmds.push_back({"HDEL", gkey, task->evicted_hash});
-            cmds.push_back({"HDEL", r->globalCrcKey(), task->evicted_hash});
           }
           cmds.push_back({"HSET", key, task->hash, std::to_string(task->slot_id)});
           cmds.push_back({"HSET", gkey, task->hash, std::to_string(shard_id) + ":" + std::to_string(task->slot_id)});

@@ -775,24 +775,47 @@ def main(argv: list[str] | None = None) -> int:
             mode = "w" if args.op == "write" else "r"
             for hid in hash_ids:
                 h128s = _hash_128s_for_one_block(hash_id=hid, pages_per_block=pages_per_block)
-                task = svc.create(hash_128s=h128s, kv_page_indexer=indexer, mode=mode)
-                _wait_task(task, timeout_s=60.0)
 
-                # Ensure the Redis global mapping is actually visible before reporting success.
-                # This prevents tests from racing on the index publish path (journal worker).
                 if args.op == "write" and not disable_coord:
+                    # Race fix: _maybe_wait_for_single_node_ownership checks etcd
+                    # directly, but the coordinator daemon thread may not have called
+                    # C++ update_shard_assignments() yet.  If the write completes as
+                    # a no-op (written==0, treated as dedupe-skip by the engine) the
+                    # Redis global mapping is never published.  Retry the write with
+                    # back-off so the coordinator has time to push assignments.
                     field_hex = format(int(hid), "032x")
-                    deadline = time.time() + 10.0
-                    while time.time() < deadline:
-                        try:
-                            ok = svc._c.query([field_hex])
-                            if ok == [True]:
-                                break
-                        except Exception:
-                            pass
-                        time.sleep(0.02)
+                    outer_deadline = time.time() + 30.0
+                    max_attempts = 10
+                    for _attempt in range(max_attempts):
+                        task = svc.create(hash_128s=h128s, kv_page_indexer=indexer, mode=mode)
+                        _wait_task(task, timeout_s=60.0)
+
+                        # Verify the Redis global mapping is visible.
+                        verify_deadline = time.time() + 5.0
+                        mapping_ok = False
+                        while time.time() < verify_deadline:
+                            try:
+                                ok = svc._c.query([field_hex])
+                                if ok == [True]:
+                                    mapping_ok = True
+                                    break
+                            except Exception:
+                                pass
+                            time.sleep(0.02)
+
+                        if mapping_ok:
+                            break
+
+                        # Write was likely a no-op (no writable shards yet).
+                        # Wait a bit for the coordinator thread to catch up.
+                        if time.time() >= outer_deadline:
+                            raise TimeoutError(f"timeout waiting Redis global index mapping for {field_hex}")
+                        time.sleep(0.5)
                     else:
-                        raise TimeoutError(f"timeout waiting Redis global index mapping for {field_hex}")
+                        raise TimeoutError(f"timeout waiting Redis global index mapping for {field_hex} after {max_attempts} attempts")
+                else:
+                    task = svc.create(hash_128s=h128s, kv_page_indexer=indexer, mode=mode)
+                    _wait_task(task, timeout_s=60.0)
 
         elif args.op in ("write_verify", "read_verify"):
             if not hash_ids:

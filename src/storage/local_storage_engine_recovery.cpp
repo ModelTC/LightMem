@@ -168,9 +168,15 @@ void LocalStorageEngine::recoverShardToRedis(size_t shard_id) {
   if (auto prev = redis->hgetall(key); prev.has_value() && (prev->size() % 2 == 0)) {
     for (size_t i = 0; i + 1 < prev->size(); i += 2) {
       const std::string &old_hash = (*prev)[i];
+      const std::string &old_slot = (*prev)[i + 1];
       if (mapping.find(old_hash) == mapping.end()) {
-        (void)redis->hdel(gkey, old_hash);
-        (void)redis->hdel(redis->globalCrcKey(), old_hash);
+        // Conditional delete: only remove global mapping if it still points to this shard+slot.
+        const std::string expected = std::to_string(shard_id) + ":" + old_slot;
+        auto cur = redis->hget(gkey, old_hash);
+        if (cur.has_value() && *cur == expected) {
+          (void)redis->hdel(gkey, old_hash);
+          (void)redis->hdel(redis->globalCrcKey(), old_hash);
+        }
       }
     }
   }
@@ -281,8 +287,6 @@ void LocalStorageEngine::recoverShardToRedisIncremental(size_t shard_id) {
   for (const auto &op : ops) {
     if (!op.evicted.empty()) {
       cmds.push_back({"HDEL", key, op.evicted});
-      cmds.push_back({"HDEL", gkey, op.evicted});
-      cmds.push_back({"HDEL", redis->globalCrcKey(), op.evicted});
     }
     cmds.push_back({"HSET", key, op.hash, std::to_string(op.slot_id)});
     cmds.push_back({"HSET", gkey, op.hash, std::to_string(shard_id) + ":" + std::to_string(op.slot_id)});
@@ -293,6 +297,19 @@ void LocalStorageEngine::recoverShardToRedisIncremental(size_t shard_id) {
   if (!redis->pipeline(cmds)) {
     std::fprintf(stderr, "[light_mem warning] recoverShardToRedisIncremental: Redis pipeline failed (shard=%zu cmds=%zu)\n",
                  shard_id, cmds.size());
+  }
+
+  // Conditional cleanup for evictions (do after pipeline).
+  // The evicted hash previously occupied the same slot being overwritten by op.hash.
+  for (const auto &op : ops) {
+    if (!op.evicted.empty()) {
+      const std::string expected = std::to_string(shard_id) + ":" + std::to_string(op.slot_id);
+      auto cur = redis->hget(gkey, op.evicted);
+      if (cur.has_value() && *cur == expected) {
+        (void)redis->hdel(gkey, op.evicted);
+        (void)redis->hdel(redis->globalCrcKey(), op.evicted);
+      }
+    }
   }
 }
 
@@ -508,8 +525,13 @@ void LocalStorageEngine::recoverShard(size_t shard_id, size_t shard_capacity) {
           replay_ok = false;
           break;
         }
-        (void)redis->hdel(gkey, op.evicted);
-        (void)redis->hdel(redis->globalCrcKey(), op.evicted);
+        // Conditional global delete to avoid deleting a newer mapping for the same hash.
+        const std::string expected = std::to_string(shard_id) + ":" + std::to_string(op.slot_id);
+        auto cur = redis->hget(gkey, op.evicted);
+        if (cur.has_value() && *cur == expected) {
+          (void)redis->hdel(gkey, op.evicted);
+          (void)redis->hdel(redis->globalCrcKey(), op.evicted);
+        }
       }
       if (!redis->hset(key, op.hash, std::to_string(op.slot_id))) {
         std::fprintf(stderr, "[light_mem warning] recoverShard: Redis HSET shard index failed (shard=%zu hash=%s)\n",
