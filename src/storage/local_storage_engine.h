@@ -95,6 +95,12 @@ public:
   // `evictionObserved`: quick boolean check (evictionCount() > 0).
   bool evictionObserved() const;
 
+  // Online-mode observability: shard ownership and effective write capacity.
+  // - "owned" means this node currently has shard ownership (readable), regardless of draining.
+  // - "effective" write capacity counts only shards that are writable (owned AND not draining).
+  size_t ownedShardCount() const;
+  uint64_t effectiveWritableCapacityBytes() const;
+
   std::shared_ptr<HashInfo> getHashInfo();
   bool setHashInfo(const std::shared_ptr<HashInfo> &info);
 

@@ -221,5 +221,36 @@ uint64_t LocalStorageEngine::evictionCount() const {
 
 bool LocalStorageEngine::evictionObserved() const { return evictionCount() > 0; }
 
+size_t LocalStorageEngine::ownedShardCount() const {
+  size_t owned = 0;
+  for (size_t i = 0; i < shard_; i++) {
+    if (shard_writable_[i].load(std::memory_order_relaxed) != 0) {
+      owned++;
+    }
+  }
+  return owned;
+}
+
+uint64_t LocalStorageEngine::effectiveWritableCapacityBytes() const {
+  if (shard_ == 0) {
+    return 0;
+  }
+
+  size_t writable = 0;
+  for (size_t i = 0; i < shard_; i++) {
+    if (isShardWritable(i, nullptr)) {
+      writable++;
+    }
+  }
+
+  const uint64_t per_shard = static_cast<uint64_t>(storage_size_ / shard_);
+  const uint64_t w = static_cast<uint64_t>(writable);
+  // Best-effort overflow guard.
+  if (per_shard != 0 && w > (std::numeric_limits<uint64_t>::max() / per_shard)) {
+    return std::numeric_limits<uint64_t>::max();
+  }
+  return per_shard * w;
+}
+
 } // namespace storage
 } // namespace cache

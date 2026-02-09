@@ -269,8 +269,16 @@ protected:
       last_logged_bytes_ = total;
 
       const double total_gb = static_cast<double>(total) / (1024.0 * 1024.0 * 1024.0);
-      std::fprintf(stderr, "[light_mem] cumulative disk write size: %.2f GB, recent write speed: %.2f GB/s\n",
-                   total_gb, speed_gbps);
+
+      const size_t owned_shards = storage_->ownedShardCount();
+      const uint64_t effective_bytes = storage_->effectiveWritableCapacityBytes();
+      const double effective_gb = static_cast<double>(effective_bytes) / (1024.0 * 1024.0 * 1024.0);
+      const bool evict = storage_->evictionObserved();
+
+      std::fprintf(stderr,
+                   "[light_mem] cumulative disk write size: %.2f GB, recent write speed: %.2f GB/s, owned_shards: %zu, "
+                   "effective_write_capacity: %.2f GB, evict: %s\n",
+                   total_gb, speed_gbps, owned_shards, effective_gb, evict ? "True" : "False");
       std::fflush(stderr);
       return;
     }
