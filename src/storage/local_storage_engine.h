@@ -58,8 +58,15 @@ public:
   // Batch query variant for high-throughput callers.
   // Returns one bool per hash (same order). In online mode this answers "readable on this node".
   std::vector<bool> queryMany(const std::vector<std::string> &hashs) override;
+  // StorageEngine overrides keep legacy semantics (full block_size_ I/O and CRC).
   size_t write(const char *buf, const std::string &hash) override;
   size_t read(char *buf, const std::string &hash) override;
+
+  // Length-aware variants used by the cache service.
+  // - `len_bytes` is the logical byte count for this block in the task (num_pages_in_block * page_size).
+  // - In online mode, CRC is computed/validated over len_bytes to avoid hashing unused tail bytes.
+  size_t write(const char *buf, const std::string &hash, uint32_t data_crc, uint32_t len_bytes);
+  size_t read(char *buf, const std::string &hash, uint32_t len_bytes);
 
   // Distributed/online mode control-plane API.
   // Update per-shard ownership state as seen by this node.
@@ -103,6 +110,12 @@ public:
 
   std::shared_ptr<HashInfo> getHashInfo();
   bool setHashInfo(const std::shared_ptr<HashInfo> &info);
+
+  // When true, the engine is under coordinator control (multi-node / shard handoff).
+  // In this mode, writes must be fenced and made durable before being exposed via Redis.
+  // When false (default), "online" can be used for single-node Redis-backed indexing/persistence
+  // without paying the full multi-node write-path costs.
+  bool coordinatedMode() const { return coordinated_mode_.load(std::memory_order_relaxed) != 0; }
 
 private:
   size_t getShard(const std::string &hash) const;
@@ -242,6 +255,10 @@ private:
   // When online mode is enabled, shards can be dynamically assigned and hash->shard is not deterministic.
   // In the default single-node mode, keep deterministic sharding to make query/write O(1) per hash.
   bool online_mode_ = false;
+
+  // Set to true when updateShardAssignments() is called.
+  // Used to enable strict multi-node semantics.
+  std::atomic<uint8_t> coordinated_mode_{0};
 
   // hash -> shard_id (bounded by eviction).
   // NOTE: This is on the hot read path in online mode. Using a single global shared_mutex

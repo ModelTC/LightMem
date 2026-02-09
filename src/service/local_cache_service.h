@@ -24,6 +24,8 @@
 #include <thread>
 #include <vector>
 
+#include <zlib.h> // crc32
+
 using namespace std;
 using namespace cache::task;
 using namespace cache::queue;
@@ -204,21 +206,6 @@ protected:
     }
 
     if (task->operation_mode == cache::task::Mode::Write) {
-      // Keep log format identical to historical output, but compute recent write speed
-      // with end-to-end task timing to match benchmark scripts more closely.
-      // - bytes (for speed) = pages * page_size (logical/requested bytes)
-      // - time  (for speed) = create() -> ready() end-to-end (per task)
-      const int64_t start_ticks = task->submit_time_ticks.load(std::memory_order_relaxed);
-      const int64_t end_ticks = task->finish_time_ticks.load(std::memory_order_relaxed);
-      if (start_ticks != 0 && end_ticks != 0 && end_ticks > start_ticks) {
-        const int64_t pages = task->page_indexer.numel();
-        const uint64_t logical_bytes =
-            static_cast<uint64_t>(pages) * static_cast<uint64_t>(this->page_size());
-        const int64_t elapsed_ticks = end_ticks - start_ticks;
-        window_logical_written_bytes_.fetch_add(logical_bytes, std::memory_order_relaxed);
-        window_logical_write_time_ticks_.fetch_add(elapsed_ticks, std::memory_order_relaxed);
-      }
-
       // Try to acquire the lock, skip logging if contention occurs
       std::unique_lock<std::mutex> guard(log_mutex_, std::try_to_lock);
       if (!guard.owns_lock()) {
@@ -232,8 +219,9 @@ protected:
 
       const auto now = std::chrono::steady_clock::now();
       if (last_log_time_ != std::chrono::steady_clock::time_point{}) {
-        const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time_);
-        if (elapsed < std::chrono::seconds(3)) {
+        const double elapsed_sec =
+            std::chrono::duration_cast<std::chrono::duration<double>>(now - last_log_time_).count();
+        if (elapsed_sec < 3.0) {
           return;
         }
       }
@@ -242,26 +230,14 @@ protected:
       const uint64_t delta_bytes = (total >= previous_bytes) ? (total - previous_bytes) : 0;
       double speed_gbps = 0.0;
 
-      // Prefer end-to-end (script-like) accounting for speed.
-      const uint64_t window_bytes = window_logical_written_bytes_.exchange(0, std::memory_order_relaxed);
-      const int64_t window_ticks = window_logical_write_time_ticks_.exchange(0, std::memory_order_relaxed);
-      if (window_bytes != 0 && window_ticks > 0) {
-        const auto window_dur =
-            std::chrono::steady_clock::duration(static_cast<std::chrono::steady_clock::duration::rep>(window_ticks));
-        const double window_sec = std::chrono::duration_cast<std::chrono::duration<double>>(window_dur).count();
-        if (window_sec > 0.0) {
-          speed_gbps = (static_cast<double>(window_bytes) / (1024.0 * 1024.0 * 1024.0)) / window_sec;
-        }
-      }
-
-      // Fallback: if window accounting isn't available, keep legacy behavior.
-      if (speed_gbps == 0.0) {
-        if (last_log_time_ != std::chrono::steady_clock::time_point{}) {
-          const double elapsed_sec =
-              std::chrono::duration_cast<std::chrono::duration<double>>(now - last_log_time_).count();
-          if (elapsed_sec > 0.0) {
-            speed_gbps = (static_cast<double>(delta_bytes) / (1024.0 * 1024.0 * 1024.0)) / elapsed_sec;
-          }
+      // IMPORTANT: use wall-clock delta between log prints.
+      // Summing per-task (create()->ready()) durations double-counts time under concurrency,
+      // which makes the reported speed much smaller than the actual byte growth.
+      if (last_log_time_ != std::chrono::steady_clock::time_point{}) {
+        const double elapsed_sec =
+            std::chrono::duration_cast<std::chrono::duration<double>>(now - last_log_time_).count();
+        if (elapsed_sec > 0.0) {
+          speed_gbps = (static_cast<double>(delta_bytes) / (1024.0 * 1024.0 * 1024.0)) / elapsed_sec;
         }
       }
 
@@ -287,18 +263,28 @@ protected:
       return;
     }
 
-    // For read mode, align bandwidth accounting with benchmark scripts:
-    // - bytes (for speed) = pages * page_size (logical/requested bytes)
-    // - time  (for speed) = create() -> ready() end-to-end (per task)
+    // Track end-to-end read window (create() -> ready()) using min(start) and max(end).
+    // This avoids summing per-task durations (which double-counts time under concurrency).
     const int64_t start_ticks = task->submit_time_ticks.load(std::memory_order_relaxed);
     const int64_t end_ticks = task->finish_time_ticks.load(std::memory_order_relaxed);
     if (start_ticks != 0 && end_ticks != 0 && end_ticks > start_ticks) {
-      const int64_t pages = task->page_indexer.numel();
-      const uint64_t logical_bytes =
-          static_cast<uint64_t>(pages) * static_cast<uint64_t>(this->page_size());
-      const int64_t elapsed_ticks = end_ticks - start_ticks;
-      window_logical_read_bytes_.fetch_add(logical_bytes, std::memory_order_relaxed);
-      window_logical_read_time_ticks_.fetch_add(elapsed_ticks, std::memory_order_relaxed);
+      // window_read_start_ticks_ = min(window_read_start_ticks_, start_ticks)
+      int64_t cur = window_read_start_ticks_.load(std::memory_order_relaxed);
+      while (cur == 0 || start_ticks < cur) {
+        if (window_read_start_ticks_.compare_exchange_weak(cur, start_ticks, std::memory_order_relaxed,
+                                                          std::memory_order_relaxed)) {
+          break;
+        }
+      }
+
+      // window_read_end_ticks_ = max(window_read_end_ticks_, end_ticks)
+      cur = window_read_end_ticks_.load(std::memory_order_relaxed);
+      while (end_ticks > cur) {
+        if (window_read_end_ticks_.compare_exchange_weak(cur, end_ticks, std::memory_order_relaxed,
+                                                        std::memory_order_relaxed)) {
+          break;
+        }
+      }
     }
 
     if (active_read_creates_.load(std::memory_order_relaxed) != 0) {
@@ -307,21 +293,27 @@ protected:
 
     std::lock_guard<std::mutex> guard(read_log_mutex_);
 
-    const uint64_t window_bytes = window_logical_read_bytes_.exchange(0, std::memory_order_relaxed);
-    const int64_t window_ticks = window_logical_read_time_ticks_.exchange(0, std::memory_order_relaxed);
-    if (window_bytes == 0 || window_ticks <= 0) {
+    if (active_read_creates_.load(std::memory_order_relaxed) != 0) {
       return;
     }
 
-    const auto window_dur =
-        std::chrono::steady_clock::duration(static_cast<std::chrono::steady_clock::duration::rep>(window_ticks));
-    const double window_sec = std::chrono::duration_cast<std::chrono::duration<double>>(window_dur).count();
-    if (window_sec <= 0.0) {
+    const uint64_t window_bytes = total_read_bytes_.exchange(0, std::memory_order_relaxed);
+    const int64_t window_start = window_read_start_ticks_.exchange(0, std::memory_order_relaxed);
+    const int64_t window_end = window_read_end_ticks_.exchange(0, std::memory_order_relaxed);
+    if (window_bytes == 0 || window_start == 0 || window_end == 0 || window_end <= window_start) {
+      return;
+    }
+
+    const int64_t elapsed_ticks = window_end - window_start;
+    const auto elapsed_dur =
+        std::chrono::steady_clock::duration(static_cast<std::chrono::steady_clock::duration::rep>(elapsed_ticks));
+    const double elapsed_sec = std::chrono::duration_cast<std::chrono::duration<double>>(elapsed_dur).count();
+    if (elapsed_sec <= 0.0) {
       return;
     }
 
     const double window_gb = static_cast<double>(window_bytes) / (1024.0 * 1024.0 * 1024.0);
-    const double speed_gbps = window_gb / window_sec;
+    const double speed_gbps = window_gb / elapsed_sec;
     if (speed_gbps <= 0.0) {
       return;
     }
@@ -402,13 +394,14 @@ private:
                                                      std::memory_order_relaxed);
     }
 
-    const size_t read_bytes = storage_->read(cpu_buffer, block->hash);
-    if (read_bytes != block_size_) {
+    const uint32_t logical_bytes = static_cast<uint32_t>(num_of_page * this->cache_info_.page_size);
+    const size_t read_bytes = storage_->read(cpu_buffer, block->hash, logical_bytes);
+    if (read_bytes != static_cast<size_t>(logical_bytes)) {
       // Only log if it's a real I/O error (partial read), not cache miss (read_bytes == 0)
       if (read_bytes != 0) {
         fprintf(stderr,
-                "[light_mem error] handleReadCpu: partial read for hash %s, expected %zu bytes, got %zu bytes\n",
-                block->hash.c_str(), block_size_, read_bytes);
+                "[light_mem error] handleReadCpu: partial read for hash %s, expected %u bytes, got %zu bytes\n",
+                block->hash.c_str(), logical_bytes, read_bytes);
       }
       return false;
     }
@@ -442,15 +435,24 @@ private:
                                                       std::memory_order_relaxed);
     }
 
-    // Step 1: Gather data from KV cache to temporary buffer
-    cpu_gather(this->cache_info_, cpu_buffer, page_ptr, num_of_page);
+    const uint32_t logical_bytes = static_cast<uint32_t>(num_of_page * this->cache_info_.page_size);
+
+    // Step 1: Gather data from KV cache to temporary buffer.
+    // In online mode, compute CRC over the logical bytes during gather to avoid an extra full-buffer scan.
+    uint32_t data_crc = 0;
+    if (online_mode()) {
+      data_crc = cpu_gather_crc32(this->cache_info_, cpu_buffer, page_ptr, num_of_page);
+    } else {
+      cpu_gather(this->cache_info_, cpu_buffer, page_ptr, num_of_page);
+    }
 
     // Critical optimization: Mark data as ready immediately after gather completes
     // This allows Python layer to release pages without waiting for disk I/O
     task->num_data_ready_blocks.fetch_add(1, std::memory_order_release);
 
     // Step 2: Write to disk (this happens asynchronously and doesn't block page release)
-    const size_t written = storage_->write(cpu_buffer, block->hash);
+    const size_t written = online_mode() ? storage_->write(cpu_buffer, block->hash, data_crc, logical_bytes)
+                       : storage_->write(cpu_buffer, block->hash);
 
     // Handle different write results:
     // - written == block_size_: Success, new data written
@@ -463,11 +465,23 @@ private:
       return false;
     }
 
-    // If written == 0, it means:
-    // 1. Hash already exists (deduplication)
-    // 2. Temporary failure (all slots busy, I/O error)
-    // 3. Write was skipped
-    // This is acceptable for cache operations - treat as success to avoid abort
+    // If written == 0:
+    // - Offline mode: treat as failure (avoid silent data loss).
+    // - Online mode: only treat as success if the hash is actually readable (e.g. dedupe hit).
+    if (written == 0) {
+      if (!online_mode()) {
+        return false;
+      }
+      // Verify existence on the slow-path to avoid reporting Finished when nothing is readable.
+      // This also covers strict-mode failures where write() returns 0 after a failed commit.
+      const auto exists = storage_->queryMany(std::vector<std::string>{block->hash});
+      if (exists.empty() || !exists[0]) {
+        std::fprintf(stderr,
+                     "[light_mem error] handleWriteCpu: write returned 0 and hash not readable: %s\n",
+                     block->hash.c_str());
+        return false;
+      }
+    }
     if (written == block_size_) {
       total_written_bytes_.fetch_add(static_cast<uint64_t>(written), std::memory_order_relaxed);
     }
@@ -598,6 +612,57 @@ private:
     }
   }
 
+  // Gather + CRC in one pass (CRC over the logical bytes only: num_of_page * page_size).
+  static uint32_t cpu_gather_crc32(const CacheParam_t &info, char *block, const int32_t *page_idx,
+                                  int64_t num_of_page) {
+    const int64_t page_size = info.page_size;
+    const int64_t page_stride = info.page_stride;
+    const int64_t total_pages = info.num_of_page;
+    const int64_t page_bytes = page_size;
+
+    uLong crc = ::crc32(0, Z_NULL, 0);
+
+    // Fast path: if source pages are contiguous in memory and indices form a contiguous range.
+    if (num_of_page > 0 && page_stride == page_bytes) {
+      const int32_t first = page_idx[0];
+      if (first < 0 || first >= total_pages) {
+        throw std::runtime_error("kv page index out of range in cpu_gather_crc32.");
+      }
+      bool contiguous = true;
+      for (int64_t local_page = 1; local_page < num_of_page; ++local_page) {
+        const int32_t expected = first + static_cast<int32_t>(local_page);
+        if (page_idx[local_page] != expected) {
+          contiguous = false;
+          break;
+        }
+      }
+      if (contiguous) {
+        const int32_t last = first + static_cast<int32_t>(num_of_page - 1);
+        if (last < 0 || last >= total_pages) {
+          throw std::runtime_error("kv page index out of range in cpu_gather_crc32.");
+        }
+        const char *src_ptr = info.base_ptr + static_cast<int64_t>(first) * page_stride;
+        const size_t nbytes = static_cast<size_t>(num_of_page) * static_cast<size_t>(page_bytes);
+        std::memcpy(block, src_ptr, nbytes);
+        crc = ::crc32(crc, reinterpret_cast<const Bytef *>(src_ptr), nbytes);
+        return static_cast<uint32_t>(crc);
+      }
+    }
+
+    for (int64_t local_page = 0; local_page < num_of_page; ++local_page) {
+      const int32_t src_page = page_idx[local_page];
+      if (src_page < 0 || src_page >= total_pages) {
+        throw std::runtime_error("kv page index out of range in cpu_gather_crc32.");
+      }
+
+      const char *src_page_ptr = info.base_ptr + static_cast<int64_t>(src_page) * page_stride;
+      char *dst_page_ptr = block + local_page * page_bytes;
+      std::memcpy(dst_page_ptr, src_page_ptr, page_bytes);
+      crc = ::crc32(crc, reinterpret_cast<const Bytef *>(src_page_ptr), static_cast<size_t>(page_bytes));
+    }
+    return static_cast<uint32_t>(crc);
+  }
+
   size_t block_size_;                        ///< Block size
   unique_ptr<LocalStorageEngine> storage_;   ///< Local storage engine
   vector<thread> workers_;                   ///< Worker threads
@@ -621,9 +686,12 @@ private:
   std::atomic<uint64_t> total_read_bytes_{0};
   std::atomic<uint64_t> window_logical_read_bytes_{0};
   std::atomic<int64_t> window_logical_read_time_ticks_{0};
+  std::atomic<int64_t> window_read_start_ticks_{0};
+  std::atomic<int64_t> window_read_end_ticks_{0};
   std::atomic<int64_t> first_read_time_ticks_{0};
   std::atomic<int64_t> last_read_time_ticks_{0};
   std::mutex read_log_mutex_;
+  std::chrono::steady_clock::time_point read_last_log_time_{};
   uint64_t read_last_logged_bytes_{0};
 
   // Ensure the backing storage path exposes enough disk capacity for the requested cache size.

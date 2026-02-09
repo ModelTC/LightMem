@@ -37,6 +37,19 @@ def _wait_task(task, timeout_s: float = 60.0) -> None:
         time.sleep(0.001)
 
 
+def _wait_query_true(svc: PyLocalCacheService, hid: str, timeout_s: float = 30.0) -> None:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            if svc.query([hid]) == [True]:
+                return
+        except Exception:
+            # Best-effort: query may transiently fail while services warm up.
+            pass
+        time.sleep(0.05)
+    raise AssertionError(f"query did not become True within {timeout_s}s for hid={hid}")
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--mode", required=True, choices=["write_then_crash", "restart_and_verify"])
@@ -83,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # restart_and_verify
     for hid in hashes:
-        assert svc.query([hid]) == [True]
+        _wait_query_true(svc, hid, timeout_s=30.0)
         h128s = build_hash_128s_for_blocks(block_hash_ids=[hid], pages_per_block=n_pages)
         t = svc.create(hash_128s=h128s, kv_page_indexer=indexer, mode="r")
         _wait_task(t)

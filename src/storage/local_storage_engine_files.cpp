@@ -88,6 +88,8 @@ static int open_existing_or_create_new(const std::string &path, size_t prealloca
 
   if (created) {
     if (preallocate_size > 0) {
+      // Fast sparse preallocation (matches historical behavior): set the apparent file size
+      // without forcing physical block allocation.
       if (::lseek(fd, static_cast<off_t>(preallocate_size - 1), SEEK_SET) < 0 || ::write(fd, "", 1) != 1) {
         const int err = errno;
         ::close(fd);

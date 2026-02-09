@@ -23,12 +23,15 @@ kvcache = torch.randint(0, 10, size=[NUM_PAGES, page_elements], dtype=DTYPE, dev
 kvcache_backup = kvcache.clone()
 
 os.makedirs("cache", exist_ok=True)
+
 service = PyLocalCacheService(
     kvcache_tensor=kvcache,
     file="cache/write_perf",
     storage_size=FILE_SIZE,
     num_shard=32,
     num_worker=32,
+    # Use explicit host:port to avoid implicit etcd inference (host-only enables coordinator by default).
+    index_endpoint="10.120.178.80:6379",
 #    bandwidth_log=False,
 )
 
@@ -65,15 +68,21 @@ task = service.create(hash_128s=hash_128s_all, kv_page_indexer=all_indexer, mode
 while not task.ready():
     pass
 
+write_states = task.state()
+
 kvcache.zero_()
 task = service.create(hash_128s=hash_128s_all, kv_page_indexer=all_indexer, mode="r")
 while not task.ready():
     pass
 
+read_states = task.state()
+
 if torch.allclose(kvcache, kvcache_backup):
     print("✓ 数据完整性验证通过")
 else:
     print("✗ 数据完整性验证失败")
+    print(f"write states: {write_states}")
+    print(f"read states:  {read_states}")
 
 print("=" * 60)
 
