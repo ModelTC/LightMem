@@ -37,6 +37,15 @@ target_compile_definitions(${name} PRIVATE MODULE_NAME=${name})
 target_compile_features(${name} PRIVATE cxx_std_17)
 target_link_libraries(${name} PRIVATE Python::Python Boost::boost ZLIB::ZLIB ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY})
 
+if(LIGHTMEM_ENABLE_ASAN)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(${name} PRIVATE -fsanitize=address -fno-omit-frame-pointer)
+    target_link_options(${name} PRIVATE -fsanitize=address)
+  else()
+    message(WARNING "LIGHTMEM_ENABLE_ASAN is ON but compiler '${CMAKE_CXX_COMPILER_ID}' is not supported for ASan")
+  endif()
+endif()
+
 # Fix for macOS ARM64: use flat namespace to resolve symbols properly
 if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
   target_link_options(${name} PRIVATE

@@ -13,14 +13,15 @@ lightmem_server = "light_mem.server_cli:main"
 
 [build-system]
 requires = ["py-build-cmake~=0.4.3"]
-build-backend = "py_build_cmake.build"
+build-backend = "lightmem_build_backend"
+backend-path = ["."]
 
 [tool.py-build-cmake.module]
 name = "light_mem"
 directory = "python"
 
 [tool.py-build-cmake.sdist]
-include = ["CMakeLists.txt", "src", "python"]
+include = ["CMakeLists.txt", "src", "python", "lightmem_build_backend.py"]
 
 [tool.py-build-cmake.cmake]
 minimum_version = "3.24"

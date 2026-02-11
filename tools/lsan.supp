@@ -1,0 +1,31 @@
+# LeakSanitizer suppressions for running LightMem tests under Python + PyTorch.
+#
+# Rationale:
+# - CPython and libtorch/pybind11 keep global caches and allocations that are
+#   intentionally not freed at process exit. With `detect_leaks=1`, these show
+#   up as leaks and can cause test runs to abort.
+# - These suppressions aim to reduce noise so leaks in LightMem's C++ code are
+#   easier to spot.
+#
+# Notes:
+# - Suppressions match by symbol name in the leak stack.
+# - Keep this file minimal; avoid overly broad patterns if possible.
+
+# CPython allocator / unicode internals (common shutdown leaks)
+leak:_PyMem_RawMalloc
+leak:_PyObject_Malloc
+leak:PyObject_Malloc
+leak:_PyObject_New
+leak:PyUnicode_New
+leak:PyFloat_FromDouble
+
+# CPython GC allocation helpers
+leak:_PyObject_GC_Alloc
+leak:_PyObject_GC_Malloc
+leak:_PyObject_GC_NewVar
+
+# pybind11 function record allocations (often kept for module lifetime)
+leak:pybind11::cpp_function::make_function_record
+
+# PyTorch binding init (pybind registrations)
+leak:torch::jit::initJITBindings
