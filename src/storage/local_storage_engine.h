@@ -95,11 +95,6 @@ public:
   std::shared_ptr<HashInfo> getHashInfo();
   bool setHashInfo(const std::shared_ptr<HashInfo> &info);
 
-  // When true, the engine is under coordinator control (multi-node / shard handoff).
-  // In this mode, writes must be fenced and made durable before being exposed via Redis.
-  // When false (default), "online" can be used for single-node Redis-backed indexing/persistence
-  // without paying the full multi-node write-path costs.
-  bool coordinatedMode() const { return coordinated_mode_.load(std::memory_order_relaxed) != 0; }
 
 private:
   size_t getShard(const std::string &hash) const;
@@ -232,13 +227,9 @@ private:
   std::vector<std::deque<std::shared_ptr<JournalTask>>> journal_queue_;
   std::vector<bool> journal_stop_;
 
-  // When online mode is enabled, shards can be dynamically assigned and hash->shard is not deterministic.
-  // In the default single-node mode, keep deterministic sharding to make query/write O(1) per hash.
+  // In online mode, shards can be dynamically assigned and hash->shard is not deterministic.
+  // In offline mode, deterministic sharding keeps query/write O(1) per hash.
   bool online_mode_ = false;
-
-  // Set to true when updateShardAssignments() is called.
-  // Used to enable strict multi-node semantics.
-  std::atomic<uint8_t> coordinated_mode_{0};
 
   // hash -> shard_id (bounded by eviction).
   static constexpr size_t kLocalHintBuckets = 64;

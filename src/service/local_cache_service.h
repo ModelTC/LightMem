@@ -451,7 +451,7 @@ private:
     const size_t written = storage_->write(cpu_buffer, block->hash, data_crc, logical_bytes);
 
     // Handle different write results:
-    // - written > 0: Success (len_bytes for offline/non-strict, block_size_ for strict)
+    // - written > 0: Success (len_bytes for offline, block_size_ for online)
     // - written == 0: Skipped (already exists, failed, or temporary congestion)
     if (written != 0 && written != static_cast<size_t>(logical_bytes) && written != block_size_) {
       fprintf(stderr,
@@ -462,62 +462,49 @@ private:
 
     // If written == 0:
     // - Offline mode: treat as failure (avoid silent data loss).
-    // - Online non-coordinated mode: keep original fast-path behavior (single readability check).
-    // - Online coordinated mode: tolerate short transient ownership migration windows with retries.
+    // - Online mode: tolerate short transient ownership migration windows with retries.
     size_t final_written = written;
     if (final_written == 0) {
       if (!online_mode()) {
         return false;
       }
 
-      const bool coordinated = storage_->coordinatedMode();
-
-      if (!coordinated) {
+      bool readable = false;
+      constexpr int kRetry = 3;
+      for (int attempt = 0; attempt <= kRetry; ++attempt) {
+        // Verify existence on slow-path: dedupe hit or already-published data should be readable.
         const auto exists = storage_->queryMany(std::vector<std::string>{block->hash});
-        if (exists.empty() || !exists[0]) {
-          std::fprintf(stderr,
-                       "[light_mem error] handleWriteCpu: write returned 0 and hash not readable: %s\n",
-                       block->hash.c_str());
+        if (!exists.empty() && exists[0]) {
+          readable = true;
+          break;
+        }
+
+        if (attempt == kRetry) {
+          break;
+        }
+
+        // Retry write for transient ownership handoff/draining windows.
+        std::this_thread::yield();
+        final_written = storage_->write(cpu_buffer, block->hash, data_crc, logical_bytes);
+
+        if (final_written != 0 && final_written != static_cast<size_t>(logical_bytes) && final_written != block_size_) {
+          fprintf(stderr,
+                  "[light_mem error] handleWriteCpu: unexpected retry write size for hash %s, expected %u or %zu or 0 bytes, got %zu bytes\n",
+                  block->hash.c_str(), logical_bytes, block_size_, final_written);
           return false;
         }
-      } else {
-        bool readable = false;
-        constexpr int kRetry = 3;
-        for (int attempt = 0; attempt <= kRetry; ++attempt) {
-          // Verify existence on slow-path: dedupe hit or already-published data should be readable.
-          const auto exists = storage_->queryMany(std::vector<std::string>{block->hash});
-          if (!exists.empty() && exists[0]) {
-            readable = true;
-            break;
-          }
 
-          if (attempt == kRetry) {
-            break;
-          }
-
-          // Retry write for transient ownership handoff/draining windows.
-          std::this_thread::yield();
-          final_written = storage_->write(cpu_buffer, block->hash, data_crc, logical_bytes);
-
-          if (final_written != 0 && final_written != static_cast<size_t>(logical_bytes) && final_written != block_size_) {
-            fprintf(stderr,
-                    "[light_mem error] handleWriteCpu: unexpected retry write size for hash %s, expected %u or %zu or 0 bytes, got %zu bytes\n",
-                    block->hash.c_str(), logical_bytes, block_size_, final_written);
-            return false;
-          }
-
-          if (final_written > 0) {
-            break;
-          }
+        if (final_written > 0) {
+          break;
         }
+      }
 
-        if (final_written == 0 && !readable) {
-          std::fprintf(
-              stderr,
-              "[light_mem warning] handleWriteCpu: transient write miss (possibly shard migration), hash not readable after retries: %s\n",
-              block->hash.c_str());
-          return false;
-        }
+      if (final_written == 0 && !readable) {
+        std::fprintf(
+            stderr,
+            "[light_mem warning] handleWriteCpu: transient write miss (possibly shard migration), hash not readable after retries: %s\n",
+            block->hash.c_str());
+        return false;
       }
     }
     if (final_written > 0) {

@@ -12,6 +12,8 @@ execute_process(
 
 # Derive Torch CMake path from site-packages
 set(_torch_cmake_path "${Python_SITELIB}/torch/share/cmake")
+set(_torch_include_path "${Python_SITELIB}/torch/include")
+set(_torch_api_include_path "${Python_SITELIB}/torch/include/torch/csrc/api/include")
 list(APPEND CMAKE_PREFIX_PATH "${_torch_cmake_path}")
 message(STATUS "CMAKE_PREFIX_PATH: ${CMAKE_PREFIX_PATH}")
 
@@ -32,7 +34,10 @@ set(source
 
 # library
 Python_add_library(${name} MODULE ${source} WITH_SOABI)
-target_include_directories(${name} PRIVATE .)
+target_include_directories(${name} BEFORE PRIVATE
+  "${_torch_include_path}"
+  "${_torch_api_include_path}"
+  .)
 target_compile_definitions(${name} PRIVATE MODULE_NAME=${name})
 target_compile_features(${name} PRIVATE cxx_std_17)
 target_link_libraries(${name} PRIVATE Python::Python Boost::boost ZLIB::ZLIB ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY})

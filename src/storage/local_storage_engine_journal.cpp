@@ -54,38 +54,32 @@ void LocalStorageEngine::journalWorkerLoop(size_t shard_id) {
       }
     }
 
-    const bool strict = coordinatedMode();
-    const bool persist_journal = strict || !online_mode_;
     bool ok = true;
     try {
-      if (persist_journal) {
-        if (strict) {
-          std::unique_lock<std::shared_mutex> io_lock(*io_locks_[shard_id]);
+      if (online_mode_) {
+        std::unique_lock<std::shared_mutex> io_lock(*io_locks_[shard_id]);
 
-          for (auto &task : batch) {
-            if (strict && task->epoch != 0 && task->epoch != superblock_epoch_[shard_id]) {
-              onEpochChangedLocked(shard_id, task->epoch);
-            }
-            appendJournalRecord(shard_id, task->write_offset, task->write_len, task->data_crc, task->hash,
-                                task->evicted_hash, true);
-            journal_entries_[shard_id]++;
+        for (auto &task : batch) {
+          if (task->epoch != 0 && task->epoch != superblock_epoch_[shard_id]) {
+            onEpochChangedLocked(shard_id, task->epoch);
           }
+          appendJournalRecord(shard_id, task->write_offset, task->write_len, task->data_crc, task->hash,
+                              task->evicted_hash, true);
+          journal_entries_[shard_id]++;
+        }
 
-          if (strict) {
-            writeCheckpointSuperblockOnly(shard_id);
-          }
-        } else {
-          // Offline mode: append metadata journal without taking shard io_locks_.
-          for (auto &task : batch) {
-            appendJournalRecord(shard_id, task->write_offset, task->write_len, task->data_crc, task->hash,
-                                task->evicted_hash, false);
-            journal_entries_[shard_id]++;
-          }
-          if (!batch.empty() && cache::utils::fdatasync_compat(meta_fds_[shard_id]) != 0) {
-            const int err = errno;
-            throw std::runtime_error(std::string("Failed to fdatasync meta (offline batch), errno=") +
-                                     std::to_string(err) + ", reason=" + std::string(::strerror(err)));
-          }
+        writeCheckpointSuperblockOnly(shard_id);
+      } else {
+        // Offline mode: append metadata journal without taking shard io_locks_.
+        for (auto &task : batch) {
+          appendJournalRecord(shard_id, task->write_offset, task->write_len, task->data_crc, task->hash,
+                              task->evicted_hash, false);
+          journal_entries_[shard_id]++;
+        }
+        if (!batch.empty() && cache::utils::fdatasync_compat(meta_fds_[shard_id]) != 0) {
+          const int err = errno;
+          throw std::runtime_error(std::string("Failed to fdatasync meta (offline batch), errno=") +
+                                   std::to_string(err) + ", reason=" + std::string(::strerror(err)));
         }
       }
 
@@ -106,12 +100,12 @@ void LocalStorageEngine::journalWorkerLoop(size_t shard_id) {
           }
           cmds.push_back({"HSET", key, task->hash, std::to_string(task->slot_id)});
           cmds.push_back({"HSET", gkey, task->hash, std::to_string(shard_id) + ":" + std::to_string(task->slot_id)});
-          // Only publish CRC when available (strict mode). Single-node fast mode may use 0.
+          // Only publish CRC when available.
           if (task->data_crc != 0) {
             cmds.push_back({"HSET", r->globalCrcKey(), task->hash, std::to_string(task->data_crc)});
           }
         }
-        if (strict) {
+        if (online_mode_) {
           cmds.push_back({"SET", r->shardSeqKey(shard_id), std::to_string(superblock_seq_[shard_id])});
         }
 
@@ -122,11 +116,11 @@ void LocalStorageEngine::journalWorkerLoop(size_t shard_id) {
         }
       }
 
-      // IMPORTANT (strict mode): make the local index reflect the durable commit before any
+      // IMPORTANT (online mode): make the local index reflect the durable commit before any
       // checkpoint can snapshot+truncate the WAL. Otherwise, a checkpoint racing ahead of the
       // writer thread's mark_ready() can produce a snapshot missing recent committed entries,
       // and truncating the WAL would permanently lose them.
-      if (strict && ok) {
+      if (online_mode_ && ok) {
         for (auto &task : batch) {
           if (!task->hash.empty()) {
             caches_[shard_id]->mark_ready(task->hash, task->data_crc);
@@ -154,22 +148,20 @@ void LocalStorageEngine::journalWorkerLoop(size_t shard_id) {
 
     // Best-effort checkpoint: keep WAL bounded even when Redis is down.
     // Runs AFTER signaling writers so write latency is not affected.
-    if (persist_journal) {
-      bool queue_empty = false;
-      {
-        std::lock_guard<std::mutex> lk(*journal_mu_[shard_id]);
-        queue_empty = journal_queue_[shard_id].empty();
-      }
-      if (queue_empty) {
-        try {
-          maybeCheckpoint(shard_id);
-        } catch (const std::exception &e) {
-          std::fprintf(stderr, "[light_mem warning] journalWorkerLoop: checkpoint failed (shard=%zu): %s\n",
-                       shard_id, e.what());
-        } catch (...) {
-          std::fprintf(stderr, "[light_mem warning] journalWorkerLoop: checkpoint unknown error (shard=%zu)\n",
-                       shard_id);
-        }
+    bool queue_empty = false;
+    {
+      std::lock_guard<std::mutex> lk(*journal_mu_[shard_id]);
+      queue_empty = journal_queue_[shard_id].empty();
+    }
+    if (queue_empty) {
+      try {
+        maybeCheckpoint(shard_id);
+      } catch (const std::exception &e) {
+        std::fprintf(stderr, "[light_mem warning] journalWorkerLoop: checkpoint failed (shard=%zu): %s\n",
+                     shard_id, e.what());
+      } catch (...) {
+        std::fprintf(stderr, "[light_mem warning] journalWorkerLoop: checkpoint unknown error (shard=%zu)\n",
+                     shard_id);
       }
     }
   }

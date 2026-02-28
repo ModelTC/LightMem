@@ -102,14 +102,10 @@ size_t LocalStorageEngine::pickWritableShard(const std::string &hash) const {
 void LocalStorageEngine::updateShardAssignments(const std::vector<size_t> &shard_ids,
                                                 const std::vector<uint64_t> &epochs,
                                                 const std::vector<uint8_t> &draining) {
-  // If index backend is disabled/unavailable, treat as single-node mode.
-  // Avoid enabling strict multi-node semantics and avoid doing shard recovery work.
+  // If index backend is disabled/unavailable, skip coordinator assignment updates.
   if (!online_mode_ || !redis_lock_) {
     return;
   }
-
-  // Once the coordinator starts pushing assignments, we must use strict multi-node semantics.
-  coordinated_mode_.store(1, std::memory_order_relaxed);
 
   if (shard_ids.size() != epochs.size() || shard_ids.size() != draining.size()) {
     std::fprintf(stderr, "[light_mem error] updateShardAssignments: size mismatch (ids=%zu epochs=%zu draining=%zu)\n",

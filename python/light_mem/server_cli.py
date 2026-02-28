@@ -319,48 +319,48 @@ def _run_local_services(*, index_port: int, coord_port: int, coord_peer_port: in
 
 
 def _compose_yaml(*, redis_port: int, etcd_client_port: int, etcd_peer_port: int) -> str:
-        # Minimal single-node index backend + coordinator backend.
-        # This is intentionally a thin wrapper that starts dependency services.
-        return dedent(
-                f"""
-                services:
-                    index:
-                        image: redis:7-alpine
-                        container_name: lightmem-index
-                        ports:
-                            - "{redis_port}:6379"
-                        command: ["redis-server", "--save", "", "--appendonly", "yes", "--appendfsync", "everysec"]
-                        volumes:
-                            - redis-data:/data
-                        restart: unless-stopped
+    # Minimal local dependency stack: index backend + coordinator backend.
+    # This is intentionally a thin wrapper that starts dependency services.
+    return dedent(
+            f"""
+            services:
+                index:
+                    image: redis:7-alpine
+                    container_name: lightmem-index
+                    ports:
+                        - "{redis_port}:6379"
+                    command: ["redis-server", "--save", "", "--appendonly", "yes", "--appendfsync", "everysec"]
+                    volumes:
+                        - redis-data:/data
+                    restart: unless-stopped
 
-                    coord:
-                        image: quay.io/coreos/etcd:v3.5.12
-                        container_name: lightmem-coord
-                        environment:
-                            - ETCD_NAME=coord
-                            - ETCD_DATA_DIR=/etcd-data
-                            - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
-                            - ETCD_ADVERTISE_CLIENT_URLS=http://coord:2379
-                            - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
-                            - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://coord:2380
-                            - ETCD_INITIAL_CLUSTER=coord=http://coord:2380
-                            - ETCD_INITIAL_CLUSTER_STATE=new
-                            - ETCD_INITIAL_CLUSTER_TOKEN=lightmem
-                        ports:
-                            - "{etcd_client_port}:2379"
-                            - "{etcd_peer_port}:2380"
-                        volumes:
-                            - etcd-data:/etcd-data
-                        restart: unless-stopped
+                coord:
+                    image: quay.io/coreos/etcd:v3.5.12
+                    container_name: lightmem-coord
+                    environment:
+                        - ETCD_NAME=coord
+                        - ETCD_DATA_DIR=/etcd-data
+                        - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+                        - ETCD_ADVERTISE_CLIENT_URLS=http://coord:2379
+                        - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+                        - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://coord:2380
+                        - ETCD_INITIAL_CLUSTER=coord=http://coord:2380
+                        - ETCD_INITIAL_CLUSTER_STATE=new
+                        - ETCD_INITIAL_CLUSTER_TOKEN=lightmem
+                    ports:
+                        - "{etcd_client_port}:2379"
+                        - "{etcd_peer_port}:2380"
+                    volumes:
+                        - etcd-data:/etcd-data
+                    restart: unless-stopped
 
-                volumes:
-                    redis-data:
-                        name: lightmem-redis-data
-                    etcd-data:
-                        name: lightmem-etcd-data
-                """
-        ).lstrip()
+            volumes:
+                redis-data:
+                    name: lightmem-redis-data
+                etcd-data:
+                    name: lightmem-etcd-data
+            """
+    ).lstrip()
 
 
 def main(argv: list[str] | None = None) -> int:
