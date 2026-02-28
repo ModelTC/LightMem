@@ -198,41 +198,30 @@ class EtcdShardCoordinator(threading.Thread):
             handoff_to = self._get_text(client, handoff_key)
 
             if desired == self._opt.node_id:
+                should_sync_epoch = False
                 if owner is None:
-                    ep = self._claim(client, sid, lease)
-                    if ep:
+                    if self._claim(client, owner_key, state_key, handoff_key, lease):
                         if sid not in self._owned_epoch:
                             newly_claimed.append(sid)
-                        self._owned_epoch[sid] = ep
                         self._draining[sid] = False
+                        should_sync_epoch = True
                 elif owner != self._opt.node_id:
                     # Ask current owner to drain/release.
                     self._request_handoff(client, sid)
                 else:
                     # We own it.
-                    v, meta = client.get(owner_key)
-                    # IMPORTANT: use create_revision as epoch fencing.
-                    # mod_revision can change on lease refresh (PUT with same value), which would
-                    # otherwise cause epoch churn and heavy metadata write contention in C++.
-                    ep = int(getattr(meta, "create_revision", 0) or 0)
-                    if not ep:
-                        ep = int(getattr(meta, "mod_revision", 0) or 0)
+                    if handoff_to and handoff_to != self._opt.node_id:
+                        try:
+                            client.delete(handoff_key)
+                        except Exception:
+                            pass
+                    self._draining[sid] = False
+                    should_sync_epoch = True
+
+                if should_sync_epoch:
+                    ep = self._get_owner_epoch_if_self(client, owner_key)
                     if ep:
                         self._owned_epoch[sid] = ep
-                    # If someone else requested handoff, start draining.
-                    # If this node is the desired owner, clear stale handoff_to to avoid
-                    # permanently-drained shards after transient membership changes.
-                    if handoff_to and handoff_to != self._opt.node_id:
-                        if desired == self._opt.node_id:
-                            try:
-                                client.delete(handoff_key)
-                            except Exception:
-                                pass
-                            self._draining[sid] = False
-                        else:
-                            self._draining[sid] = True
-                    else:
-                        self._draining[sid] = False
             else:
                 if owner == self._opt.node_id:
                     # We should no longer own it; start draining and release when safe.
@@ -294,11 +283,22 @@ class EtcdShardCoordinator(threading.Thread):
         except Exception:
             return None
 
-    def _claim(self, client, sid: int, lease) -> Optional[int]:
-        owner_key = self._k(f"shards/{sid}/owner")
-        state_key = self._k(f"shards/{sid}/state")
-        handoff_key = self._k(f"shards/{sid}/handoff_to")
+    def _get_owner_epoch_if_self(self, client, owner_key: str) -> Optional[int]:
+        v, meta = client.get(owner_key)
+        if v is None or meta is None:
+            return None
+        try:
+            owner = v.decode("utf-8")
+        except Exception:
+            return None
+        if owner != self._opt.node_id:
+            return None
+        ep = int(getattr(meta, "create_revision", 0) or 0)
+        if not ep:
+            ep = int(getattr(meta, "mod_revision", 0) or 0)
+        return ep
 
+    def _claim(self, client, owner_key, state_key, handoff_key, lease) -> bool:
         # Only claim if no owner.
         txn_ok, _ = client.transaction(
             compare=[
@@ -311,17 +311,7 @@ class EtcdShardCoordinator(threading.Thread):
             ],
             failure=[],
         )
-        if not txn_ok:
-            return None
-
-        # epoch = create_revision(owner_key) (stable across lease refresh)
-        v, meta = client.get(owner_key)
-        if v is None or meta is None:
-            return None
-        ep = int(getattr(meta, "create_revision", 0) or 0)
-        if not ep:
-            ep = int(getattr(meta, "mod_revision", 0) or 0)
-        return ep
+        return bool(txn_ok)
 
     def _request_handoff(self, client, sid: int) -> None:
         handoff_key = self._k(f"shards/{sid}/handoff_to")
@@ -427,7 +417,12 @@ class EtcdShardCoordinator(threading.Thread):
                         for sid in list(self._owned_epoch.keys()):
                             owner_key = self._k(f"shards/{int(sid)}/owner")
                             try:
-                                client.put(owner_key, self._opt.node_id, lease=lease)
+                                # Only update the lease if we still appear to be the owner;
+                                client.transaction(
+                                    compare=[client.transactions.value(owner_key) == self._opt.node_id],
+                                    success=[client.transactions.put(owner_key, self._opt.node_id, lease=lease)],
+                                    failure=[],
+                                )
                             except Exception:
                                 pass
                         self._start_watchers(client)

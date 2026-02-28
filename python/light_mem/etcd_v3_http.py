@@ -243,7 +243,6 @@ class EtcdV3HttpClient:
         effective_timeout = self._timeout_s if timeout_s is None else float(timeout_s)
         try:
             with urllib.request.urlopen(req, timeout=effective_timeout) as resp:
-                # Read a single streaming frame.
                 raw_line = resp.readline()
         except (urllib.error.URLError, socket.timeout) as e:
             raise ConnectionError(f"etcd lease keepalive failed: {e}") from e
