@@ -7,6 +7,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -19,6 +20,8 @@ namespace storage {
 class LocalCacheIndex {
 public:
   using Hook = std::function<void(const std::string &hash)>;
+  enum class SnapshotLoadMode { Strict, BestEffort };
+  using SnapshotEntryConsumer = std::function<void(const std::string &hash, size_t slot_id, uint32_t crc)>;
 
   /**
    * @brief Internal structure to store LRU list iterator and exists call count
@@ -84,7 +87,13 @@ public:
 
   // Snapshot operations
   bool saveToSnapshot(const std::string &filename);
-  bool loadFromSnapshot(const std::string &filename);
+  bool loadSnapshotToIndex(const std::string &filename);
+  bool loadSnapshotToMapping(const std::string &filename, std::unordered_map<std::string, size_t> &mapping,
+                             std::unordered_map<std::string, uint32_t> &crc_map,
+                             std::unordered_set<std::string> &crc_present);
+  static bool loadSnapshotEntries(const std::string &filename, size_t max_slot_exclusive, SnapshotLoadMode mode,
+                                  const SnapshotEntryConsumer &consumer,
+                                  const char *warn_prefix = "snapshot load");
 
   // Best-effort dump of ready entries for building auxiliary indices.
   // Thread-safe snapshot under the internal mutex.

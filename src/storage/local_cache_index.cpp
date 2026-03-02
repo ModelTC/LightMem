@@ -366,20 +366,39 @@ bool LocalCacheIndex::saveToSnapshot(const std::string &filename) {
   return true;
 }
 
-bool LocalCacheIndex::loadFromSnapshot(const std::string &filename) {
-  // Note: Caller should ensure reset() is called before or after as needed,
-  // but typically we load into a fresh index.
-  // We use put_ready which is thread-safe and handles locking.
+bool LocalCacheIndex::loadSnapshotToIndex(const std::string &filename) {
+  return loadSnapshotEntries(
+      filename, capacity_, SnapshotLoadMode::Strict,
+      [this](const std::string &hash, size_t slot_id, uint32_t crc) { put_ready(hash, slot_id, crc); },
+      "snapshot load");
+}
 
+bool LocalCacheIndex::loadSnapshotToMapping(const std::string &filename,
+                                            std::unordered_map<std::string, size_t> &mapping,
+                                            std::unordered_map<std::string, uint32_t> &crc_map,
+                                            std::unordered_set<std::string> &crc_present) {
+  return loadSnapshotEntries(
+      filename, capacity_, SnapshotLoadMode::BestEffort,
+      [&mapping, &crc_map, &crc_present](const std::string &hash, size_t slot_id, uint32_t crc) {
+        mapping[hash] = slot_id;
+        crc_map[hash] = crc;
+        crc_present.insert(hash);
+      },
+      "snapshot load mapping");
+}
+
+bool LocalCacheIndex::loadSnapshotEntries(const std::string &filename, size_t max_slot_exclusive, SnapshotLoadMode mode,
+                                          const SnapshotEntryConsumer &consumer, const char *warn_prefix) {
   int fd = ::open(filename.c_str(), O_RDONLY);
   if (fd < 0) {
     if (errno != ENOENT) {
-      std::fprintf(stderr, "[light_mem warning] snapshot load: open failed (file=%s errno=%d %s)\n", filename.c_str(),
-                   errno, std::strerror(errno));
+      std::fprintf(stderr, "[light_mem warning] %s: open failed (file=%s errno=%d %s)\n", warn_prefix,
+                   filename.c_str(), errno, std::strerror(errno));
     }
     return false;
   }
 
+  bool warned = false;
   int last_errno = 0;
   bool last_eof = false;
   auto read_all = [&](void *p, size_t n) -> bool {
@@ -404,21 +423,27 @@ bool LocalCacheIndex::loadFromSnapshot(const std::string &filename) {
   uint32_t magic = 0;
   uint32_t version = 0;
   uint64_t count = 0;
-
   if (!read_all(&magic, sizeof(magic)) || !read_all(&version, sizeof(version)) || !read_all(&count, sizeof(count))) {
-    if (last_eof) {
-      std::fprintf(stderr, "[light_mem warning] snapshot load: truncated header (file=%s)\n", filename.c_str());
-    } else if (last_errno != 0) {
-      std::fprintf(stderr, "[light_mem warning] snapshot load: read header failed (file=%s errno=%d %s)\n",
-                   filename.c_str(), last_errno, std::strerror(last_errno));
+    if (!warned) {
+      if (last_eof) {
+        std::fprintf(stderr, "[light_mem warning] %s: truncated header (file=%s)\n", warn_prefix, filename.c_str());
+      } else if (last_errno != 0) {
+        std::fprintf(stderr, "[light_mem warning] %s: read header failed (file=%s errno=%d %s)\n", warn_prefix,
+                     filename.c_str(), last_errno, std::strerror(last_errno));
+      }
+      warned = true;
     }
     ::close(fd);
     return false;
   }
+
   if (magic != SNAPSHOT_MAGIC || version != SNAPSHOT_VERSION) {
-    std::fprintf(stderr,
-                 "[light_mem warning] snapshot load: bad header (file=%s magic=0x%08x version=%u expect_magic=0x%08x expect_version=%u)\n",
-                 filename.c_str(), magic, version, SNAPSHOT_MAGIC, SNAPSHOT_VERSION);
+    if (!warned) {
+      std::fprintf(stderr,
+                   "[light_mem warning] %s: bad header (file=%s magic=0x%08x version=%u expect_magic=0x%08x expect_version=%u)\n",
+                   warn_prefix, filename.c_str(), magic, version, SNAPSHOT_MAGIC, SNAPSHOT_VERSION);
+      warned = true;
+    }
     ::close(fd);
     return false;
   }
@@ -426,33 +451,62 @@ bool LocalCacheIndex::loadFromSnapshot(const std::string &filename) {
   for (uint64_t i = 0; i < count; i++) {
     uint32_t hash_len = 0;
     if (!read_all(&hash_len, sizeof(hash_len)) || hash_len > 4096) {
-      std::fprintf(stderr, "[light_mem warning] snapshot load: bad hash_len (file=%s)\n", filename.c_str());
-      ::close(fd);
-      return false;
+      if (!warned) {
+        std::fprintf(stderr, "[light_mem warning] %s: bad hash_len (file=%s)\n", warn_prefix, filename.c_str());
+        warned = true;
+      }
+      if (mode == SnapshotLoadMode::Strict) {
+        ::close(fd);
+        return false;
+      }
+      break;
     }
 
     std::string hash;
     hash.resize(hash_len);
     if (hash_len > 0 && !read_all(hash.data(), hash_len)) {
-      std::fprintf(stderr, "[light_mem warning] snapshot load: read hash failed (file=%s)\n", filename.c_str());
-      ::close(fd);
-      return false;
+      if (!warned) {
+        std::fprintf(stderr, "[light_mem warning] %s: read hash failed (file=%s)\n", warn_prefix, filename.c_str());
+        warned = true;
+      }
+      if (mode == SnapshotLoadMode::Strict) {
+        ::close(fd);
+        return false;
+      }
+      break;
     }
 
     uint64_t slot_id = 0;
     if (!read_all(&slot_id, sizeof(slot_id))) {
-      std::fprintf(stderr, "[light_mem warning] snapshot load: read slot_id failed (file=%s)\n", filename.c_str());
-      ::close(fd);
-      return false;
+      if (!warned) {
+        std::fprintf(stderr, "[light_mem warning] %s: read slot_id failed (file=%s)\n", warn_prefix,
+                     filename.c_str());
+        warned = true;
+      }
+      if (mode == SnapshotLoadMode::Strict) {
+        ::close(fd);
+        return false;
+      }
+      break;
     }
 
     uint32_t crc = 0;
     if (!read_all(&crc, sizeof(crc))) {
-      std::fprintf(stderr, "[light_mem warning] snapshot load: read crc failed (file=%s)\n", filename.c_str());
-      ::close(fd);
-      return false;
+      if (!warned) {
+        std::fprintf(stderr, "[light_mem warning] %s: read crc failed (file=%s)\n", warn_prefix, filename.c_str());
+        warned = true;
+      }
+      if (mode == SnapshotLoadMode::Strict) {
+        ::close(fd);
+        return false;
+      }
+      break;
     }
-    put_ready(hash, static_cast<size_t>(slot_id), crc);
+
+    const size_t sid = static_cast<size_t>(slot_id);
+    if (sid < max_slot_exclusive) {
+      consumer(hash, sid, crc);
+    }
   }
 
   ::close(fd);

@@ -286,11 +286,12 @@ public:
     return resp.array;
   }
 
+  // Per-shard hash -> slot_id
   std::string shardIndexKey(size_t shard_id) const {
     return opt_.key_prefix + ":" + std::to_string(shard_id) + ":index";
   }
 
-  // Global hash -> "shard_id:slot_id" mapping.
+  // Global hash -> "shard_id:slot_id"
   std::string globalIndexKey() const { return opt_.key_prefix + ":global:index"; }
 
   // Global hash -> data CRC (uint32 as string).
@@ -299,6 +300,8 @@ public:
   // Per-hash lock key used to prevent concurrent writers from racing.
   std::string hashLockKey(const std::string &hash) const { return opt_.key_prefix + ":lock:" + hash; }
 
+  // Per-shard get latest superblock sequence
+  // 与shard中的meta相同，走增量恢复，不同，走全量恢复
   std::string shardSeqKey(size_t shard_id) const { return opt_.key_prefix + ":" + std::to_string(shard_id) + ":seq"; }
 
 private:

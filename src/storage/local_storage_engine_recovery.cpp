@@ -37,109 +37,15 @@ void LocalStorageEngine::recoverShardToRedis(size_t shard_id) {
   std::unordered_map<std::string, size_t> mapping;
   std::unordered_map<std::string, uint32_t> crc_map;
   std::unordered_set<std::string> crc_present;
-  {
-    constexpr uint32_t kSnapshotMagic = 0x534E4150; // SNAP
-    constexpr uint32_t kSnapshotVersion = 1;
-
-    std::stringstream ss;
-    ss << filename_ << "_" << shard_id << "/index";
-    const std::string snap_path = ss.str();
-
-    int fd = ::open(snap_path.c_str(), O_RDONLY);
-    if (fd >= 0) {
-      bool warned_snapshot = false;
-      int last_errno = 0;
-      bool last_eof = false;
-      auto read_all = [&](void *p, size_t n) -> bool {
-        char *buf = static_cast<char *>(p);
-        size_t left = n;
-        while (left > 0) {
-          ssize_t r = ::read(fd, buf, left);
-          if (r == 0) {
-            last_eof = true;
-            return false;
-          }
-          if (r < 0) {
-            last_errno = errno;
-            return false;
-          }
-          buf += static_cast<size_t>(r);
-          left -= static_cast<size_t>(r);
-        }
-        return true;
-      };
-
-      uint32_t magic = 0;
-      uint32_t version = 0;
-      uint64_t count = 0;
-      if (read_all(&magic, sizeof(magic)) && read_all(&version, sizeof(version)) && read_all(&count, sizeof(count)) &&
-          magic == kSnapshotMagic && version == kSnapshotVersion) {
-        for (uint64_t i = 0; i < count; i++) {
-          uint32_t hash_len = 0;
-          if (!read_all(&hash_len, sizeof(hash_len)) || hash_len > 4096) {
-            if (!warned_snapshot) {
-              std::fprintf(stderr, "[light_mem warning] recoverShardToRedis: snapshot truncated/corrupt (file=%s)\n",
-                           snap_path.c_str());
-              warned_snapshot = true;
-            }
-            break;
-          }
-          std::string hash;
-          hash.resize(hash_len);
-          if (hash_len > 0 && !read_all(hash.data(), hash_len)) {
-            if (!warned_snapshot) {
-              std::fprintf(stderr, "[light_mem warning] recoverShardToRedis: snapshot truncated/corrupt (file=%s)\n",
-                           snap_path.c_str());
-              warned_snapshot = true;
-            }
-            break;
-          }
-          uint64_t slot = 0;
-          if (!read_all(&slot, sizeof(slot))) {
-            if (!warned_snapshot) {
-              std::fprintf(stderr, "[light_mem warning] recoverShardToRedis: snapshot truncated/corrupt (file=%s)\n",
-                           snap_path.c_str());
-              warned_snapshot = true;
-            }
-            break;
-          }
-          uint32_t crc = 0;
-          if (!read_all(&crc, sizeof(crc))) {
-            if (!warned_snapshot) {
-              std::fprintf(stderr, "[light_mem warning] recoverShardToRedis: snapshot truncated/corrupt (file=%s)\n",
-                           snap_path.c_str());
-              warned_snapshot = true;
-            }
-            break;
-          }
-          if (slot < shard_capacity) {
-            mapping[hash] = static_cast<size_t>(slot);
-            crc_map[hash] = crc;
-            crc_present.insert(hash);
-          }
-        }
-      } else {
-        if (!warned_snapshot) {
-          if (last_eof) {
-            std::fprintf(stderr, "[light_mem warning] recoverShardToRedis: snapshot header truncated (file=%s)\n",
-                         snap_path.c_str());
-          } else if (last_errno != 0) {
-            std::fprintf(stderr,
-                         "[light_mem warning] recoverShardToRedis: snapshot header read failed (file=%s errno=%d %s)\n",
-                         snap_path.c_str(), last_errno, std::strerror(last_errno));
-          } else {
-            std::fprintf(stderr,
-                         "[light_mem warning] recoverShardToRedis: snapshot header mismatch (file=%s magic=0x%08x version=%u)\n",
-                         snap_path.c_str(), magic, version);
-          }
-          warned_snapshot = true;
-        }
-      }
-      ::close(fd);
-    } else if (errno != ENOENT) {
-      std::fprintf(stderr, "[light_mem warning] recoverShardToRedis: open snapshot failed (file=%s errno=%d %s)\n",
-                   snap_path.c_str(), errno, std::strerror(errno));
-    }
+  std::stringstream ss;
+  ss << filename_ << "_" << shard_id << "/index";
+  const std::string snap_path = ss.str();
+  const bool snapshot_loaded = caches_[shard_id]->loadSnapshotToMapping(snap_path, mapping, crc_map, crc_present);
+  if (!snapshot_loaded && ::access(snap_path.c_str(), F_OK) == 0) {
+    std::fprintf(stderr,
+                 "[light_mem warning] recoverShardToRedis: snapshot exists but load failed, continue with WAL "
+                 "(shard=%zu file=%s)\n",
+                 shard_id, snap_path.c_str());
   }
 
   // Apply WAL tail (after last checkpoint) to mapping.
@@ -161,20 +67,22 @@ void LocalStorageEngine::recoverShardToRedis(size_t shard_id) {
     }
   }
 
-  const std::string key = redis->shardIndexKey(shard_id);
-  const std::string gkey = redis->globalIndexKey();
+  const std::string shard_index_key = redis->shardIndexKey(shard_id);
+  const std::string shard_seq_key = redis->shardSeqKey(shard_id);
+  const std::string global_index_key = redis->globalIndexKey();
+  const std::string global_crc_key = redis->globalCrcKey();
 
   // Cleanup stale global-index entries for this shard using the previous shard index.
-  if (auto prev = redis->hgetall(key); prev.has_value() && (prev->size() % 2 == 0)) {
+  if (auto prev = redis->hgetall(shard_index_key); prev.has_value() && (prev->size() % 2 == 0)) {
     for (size_t i = 0; i + 1 < prev->size(); i += 2) {
       const std::string &old_hash = (*prev)[i];
       const std::string &old_slot = (*prev)[i + 1];
       if (mapping.find(old_hash) == mapping.end()) {
         const std::string expected = std::to_string(shard_id) + ":" + old_slot;
-        auto cur = redis->hget(gkey, old_hash);
+        auto cur = redis->hget(global_index_key, old_hash);
         if (cur.has_value() && *cur == expected) {
-          (void)redis->hdel(gkey, old_hash);
-          (void)redis->hdel(redis->globalCrcKey(), old_hash);
+          (void)redis->hdel(global_index_key, old_hash);
+          (void)redis->hdel(global_crc_key, old_hash);
         }
       }
     }
@@ -185,7 +93,7 @@ void LocalStorageEngine::recoverShardToRedis(size_t shard_id) {
 
   // Replace shard index with our rebuilt mapping.
   // Keep DEL in the same pipeline to reduce the chance of leaving Redis empty on a pipeline failure.
-  cmds.push_back({"DEL", key});
+  cmds.push_back({"DEL", shard_index_key});
 
   std::vector<uint8_t> buf;
   buf.resize(block_size_);
@@ -216,11 +124,11 @@ void LocalStorageEngine::recoverShardToRedis(size_t shard_id) {
       continue;
     }
 
-    cmds.push_back({"HSET", key, kv.first, std::to_string(slot_id)});
-    cmds.push_back({"HSET", gkey, kv.first, std::to_string(shard_id) + ":" + std::to_string(slot_id)});
-    cmds.push_back({"HSET", redis->globalCrcKey(), kv.first, std::to_string(crc)});
+    cmds.push_back({"HSET", shard_index_key, kv.first, std::to_string(slot_id)});
+    cmds.push_back({"HSET", global_index_key, kv.first, std::to_string(shard_id) + ":" + std::to_string(slot_id)});
+    cmds.push_back({"HSET", global_crc_key, kv.first, std::to_string(crc)});
   }
-  cmds.push_back({"SET", redis->shardSeqKey(shard_id), std::to_string(superblock_seq_[shard_id])});
+  cmds.push_back({"SET", shard_seq_key, std::to_string(superblock_seq_[shard_id])});
   if (!redis->pipeline(cmds)) {
     throw std::runtime_error("Recovery Redis pipeline failed");
   }
@@ -235,14 +143,15 @@ bool LocalStorageEngine::shouldFullRecoverRedis(size_t shard_id) {
     return false;
   }
 
-  const std::string key = redis->shardIndexKey(shard_id);
+  const std::string shard_index_key = redis->shardIndexKey(shard_id);
+  const std::string shard_seq_key = redis->shardSeqKey(shard_id);
 
-  auto hlen = redis->hlen(key);
+  auto hlen = redis->hlen(shard_index_key);
   if (!hlen.has_value() || *hlen == 0) {
     return true;
   }
 
-  auto rseq = redis->getString(redis->shardSeqKey(shard_id));
+  auto rseq = redis->getString(shard_seq_key);
   if (!rseq.has_value() || rseq->empty()) {
     return true;
   }
@@ -273,12 +182,13 @@ void LocalStorageEngine::recoverShardToRedisIncremental(size_t shard_id) {
   const off_t start_off =
       static_cast<off_t>((superblock_stable_offset_[shard_id] >= META_HEADER_SIZE) ? superblock_stable_offset_[shard_id]
                                                                                    : META_HEADER_SIZE);
+  const std::string shard_seq_key = redis->shardSeqKey(shard_id);
 
   std::vector<JournalOp> ops;
   scanWalOps(shard_id, shard_capacity, start_off, ops);
   if (ops.empty()) {
     // Still sync the shard seq so control-plane checks don't treat this as stale.
-    if (!redis->setString(redis->shardSeqKey(shard_id), std::to_string(superblock_seq_[shard_id]))) {
+    if (!redis->setString(shard_seq_key, std::to_string(superblock_seq_[shard_id]))) {
       std::fprintf(stderr,
                    "[light_mem warning] recoverShardToRedisIncremental: Redis SET shard seq failed (shard=%zu)\n",
                    shard_id);
@@ -286,20 +196,21 @@ void LocalStorageEngine::recoverShardToRedisIncremental(size_t shard_id) {
     return;
   }
 
-  const std::string key = redis->shardIndexKey(shard_id);
-  const std::string gkey = redis->globalIndexKey();
+  const std::string shard_index_key = redis->shardIndexKey(shard_id);
+  const std::string global_index_key = redis->globalIndexKey();
+  const std::string global_crc_key = redis->globalCrcKey();
 
   std::vector<std::vector<std::string>> cmds;
   cmds.reserve(ops.size() * 5 + 1);
   for (const auto &op : ops) {
     if (!op.evicted.empty()) {
-      cmds.push_back({"HDEL", key, op.evicted});
+      cmds.push_back({"HDEL", shard_index_key, op.evicted});
     }
-    cmds.push_back({"HSET", key, op.hash, std::to_string(op.slot_id)});
-    cmds.push_back({"HSET", gkey, op.hash, std::to_string(shard_id) + ":" + std::to_string(op.slot_id)});
-    cmds.push_back({"HSET", redis->globalCrcKey(), op.hash, std::to_string(op.data_crc)});
+    cmds.push_back({"HSET", shard_index_key, op.hash, std::to_string(op.slot_id)});
+    cmds.push_back({"HSET", global_index_key, op.hash, std::to_string(shard_id) + ":" + std::to_string(op.slot_id)});
+    cmds.push_back({"HSET", global_crc_key, op.hash, std::to_string(op.data_crc)});
   }
-  cmds.push_back({"SET", redis->shardSeqKey(shard_id), std::to_string(superblock_seq_[shard_id])});
+  cmds.push_back({"SET", shard_seq_key, std::to_string(superblock_seq_[shard_id])});
 
   const bool pipeline_ok = redis->pipeline(cmds);
   if (!pipeline_ok) {
@@ -316,10 +227,10 @@ void LocalStorageEngine::recoverShardToRedisIncremental(size_t shard_id) {
   for (const auto &op : ops) {
     if (!op.evicted.empty()) {
       const std::string expected = std::to_string(shard_id) + ":" + std::to_string(op.slot_id);
-      auto cur = redis->hget(gkey, op.evicted);
+      auto cur = redis->hget(global_index_key, op.evicted);
       if (cur.has_value() && *cur == expected) {
-        (void)redis->hdel(gkey, op.evicted);
-        (void)redis->hdel(redis->globalCrcKey(), op.evicted);
+        (void)redis->hdel(global_index_key, op.evicted);
+        (void)redis->hdel(global_crc_key, op.evicted);
       }
     }
   }
@@ -499,8 +410,13 @@ void LocalStorageEngine::recoverShard(size_t shard_id, size_t shard_capacity) {
   std::stringstream ss;
   ss << filename_ << "_" << shard_id << "/index";
   std::string snap_path = ss.str();
-  bool snapshot_loaded = caches_[shard_id]->loadFromSnapshot(snap_path);
-  (void)snapshot_loaded;
+  bool snapshot_loaded = caches_[shard_id]->loadSnapshotToIndex(snap_path);
+  if (!snapshot_loaded && ::access(snap_path.c_str(), F_OK) == 0) {
+    std::fprintf(stderr,
+                 "[light_mem warning] recoverShard: snapshot exists but load failed, continue with WAL "
+                 "(shard=%zu file=%s)\n",
+                 shard_id, snap_path.c_str());
+  }
 
   // 1. Scan WAL
   // We rely SOLELY on Snapshot + WAL.
@@ -527,11 +443,13 @@ void LocalStorageEngine::recoverShard(size_t shard_id, size_t shard_capacity) {
     writeCheckpointSuperblockOnly(shard_id);
 
     bool replay_ok = true;
-    const std::string key = redis->shardIndexKey(shard_id);
-    const std::string gkey = redis->globalIndexKey();
+    const std::string shard_index_key = redis->shardIndexKey(shard_id);
+    const std::string global_index_key = redis->globalIndexKey();
+    const std::string global_crc_key = redis->globalCrcKey();
+    const std::string shard_seq_key = redis->shardSeqKey(shard_id);
     for (const auto &op : ops) {
       if (!op.evicted.empty()) {
-        if (!redis->hdel(key, op.evicted)) {
+        if (!redis->hdel(shard_index_key, op.evicted)) {
           std::fprintf(stderr, "[light_mem warning] recoverShard: Redis HDEL shard index failed (shard=%zu hash=%s)\n",
                        shard_id, op.evicted.c_str());
           replay_ok = false;
@@ -539,20 +457,20 @@ void LocalStorageEngine::recoverShard(size_t shard_id, size_t shard_capacity) {
         }
         // Conditional global delete to avoid deleting a newer mapping for the same hash.
         const std::string expected = std::to_string(shard_id) + ":" + std::to_string(op.slot_id);
-        auto cur = redis->hget(gkey, op.evicted);
+        auto cur = redis->hget(global_index_key, op.evicted);
         if (cur.has_value() && *cur == expected) {
-          (void)redis->hdel(gkey, op.evicted);
-          (void)redis->hdel(redis->globalCrcKey(), op.evicted);
+          (void)redis->hdel(global_index_key, op.evicted);
+          (void)redis->hdel(global_crc_key, op.evicted);
         }
       }
-      if (!redis->hset(key, op.hash, std::to_string(op.slot_id))) {
+      if (!redis->hset(shard_index_key, op.hash, std::to_string(op.slot_id))) {
         std::fprintf(stderr, "[light_mem warning] recoverShard: Redis HSET shard index failed (shard=%zu hash=%s)\n",
                      shard_id, op.hash.c_str());
         replay_ok = false;
         break;
       }
 
-      if (!redis->hset(redis->globalCrcKey(), op.hash, std::to_string(op.data_crc))) {
+      if (!redis->hset(global_crc_key, op.hash, std::to_string(op.data_crc))) {
         std::fprintf(stderr, "[light_mem warning] recoverShard: Redis HSET crc failed (shard=%zu hash=%s)\n", shard_id,
                      op.hash.c_str());
         replay_ok = false;
@@ -560,10 +478,10 @@ void LocalStorageEngine::recoverShard(size_t shard_id, size_t shard_capacity) {
       }
 
       // Global mapping: only recover if missing; duplicates are intentionally ignored.
-      (void)redis->hsetnx(gkey, op.hash, std::to_string(shard_id) + ":" + std::to_string(op.slot_id));
+      (void)redis->hsetnx(global_index_key, op.hash, std::to_string(shard_id) + ":" + std::to_string(op.slot_id));
     }
     if (replay_ok) {
-      if (!redis->setString(redis->shardSeqKey(shard_id), std::to_string(superblock_seq_[shard_id]))) {
+      if (!redis->setString(shard_seq_key, std::to_string(superblock_seq_[shard_id]))) {
         std::fprintf(stderr, "[light_mem warning] recoverShard: Redis SET shard seq failed (shard=%zu)\n", shard_id);
         replay_ok = false;
       }
