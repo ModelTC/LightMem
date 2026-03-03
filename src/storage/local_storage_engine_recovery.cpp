@@ -18,6 +18,17 @@
 namespace cache {
 namespace storage {
 
+// Conditionally delete a hash entry from the global index and CRC map.
+static void conditionalDeleteGlobalEntry(RedisClient *redis, const std::string &hash, const std::string &expected) {
+  const std::string global_index_key = redis->globalIndexKey();
+  const std::string global_crc_key = redis->globalCrcKey();
+  auto cur = redis->hget(global_index_key, hash);
+  if (cur.has_value() && *cur == expected) {
+    (void)redis->hdel(global_index_key, hash);
+    (void)redis->hdel(global_crc_key, hash);
+  }
+}
+
 void LocalStorageEngine::recoverShardToRedis(size_t shard_id) {
   if (shard_id >= shard_) {
     return;
@@ -78,12 +89,7 @@ void LocalStorageEngine::recoverShardToRedis(size_t shard_id) {
       const std::string &old_hash = (*prev)[i];
       const std::string &old_slot = (*prev)[i + 1];
       if (mapping.find(old_hash) == mapping.end()) {
-        const std::string expected = std::to_string(shard_id) + ":" + old_slot;
-        auto cur = redis->hget(global_index_key, old_hash);
-        if (cur.has_value() && *cur == expected) {
-          (void)redis->hdel(global_index_key, old_hash);
-          (void)redis->hdel(global_crc_key, old_hash);
-        }
+        conditionalDeleteGlobalEntry(redis, old_hash, std::to_string(shard_id) + ":" + old_slot);
       }
     }
   }
@@ -226,12 +232,7 @@ void LocalStorageEngine::recoverShardToRedisIncremental(size_t shard_id) {
   // The evicted hash previously occupied the same slot being overwritten by op.hash.
   for (const auto &op : ops) {
     if (!op.evicted.empty()) {
-      const std::string expected = std::to_string(shard_id) + ":" + std::to_string(op.slot_id);
-      auto cur = redis->hget(global_index_key, op.evicted);
-      if (cur.has_value() && *cur == expected) {
-        (void)redis->hdel(global_index_key, op.evicted);
-        (void)redis->hdel(global_crc_key, op.evicted);
-      }
+      conditionalDeleteGlobalEntry(redis, op.evicted, std::to_string(shard_id) + ":" + std::to_string(op.slot_id));
     }
   }
 }
@@ -456,12 +457,7 @@ void LocalStorageEngine::recoverShard(size_t shard_id, size_t shard_capacity) {
           break;
         }
         // Conditional global delete to avoid deleting a newer mapping for the same hash.
-        const std::string expected = std::to_string(shard_id) + ":" + std::to_string(op.slot_id);
-        auto cur = redis->hget(global_index_key, op.evicted);
-        if (cur.has_value() && *cur == expected) {
-          (void)redis->hdel(global_index_key, op.evicted);
-          (void)redis->hdel(global_crc_key, op.evicted);
-        }
+        conditionalDeleteGlobalEntry(redis, op.evicted, std::to_string(shard_id) + ":" + std::to_string(op.slot_id));
       }
       if (!redis->hset(shard_index_key, op.hash, std::to_string(op.slot_id))) {
         std::fprintf(stderr, "[light_mem warning] recoverShard: Redis HSET shard index failed (shard=%zu hash=%s)\n",

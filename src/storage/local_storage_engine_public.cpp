@@ -243,10 +243,58 @@ std::vector<bool> LocalStorageEngine::queryMany(const std::vector<std::string> &
   return ret;
 }
 
-size_t LocalStorageEngine::write(const char *buf, const std::string &hash) {
-  // Legacy entry: full-block CRC.
-  const uint32_t crc = compute_crc32(buf, block_size_);
-  return write(buf, hash, crc, static_cast<uint32_t>(block_size_));
+std::optional<size_t> LocalStorageEngine::handleExistingLocalDuplicate(size_t shard_id, const std::string &hash,
+                                                                       uint32_t data_crc, int &result,
+                                                                       size_t &slot_id, std::string &evicted_hash,
+                                                                       bool do_global_dedupe,
+                                                                       const std::string &global_key) {
+  if (result != 0) {
+    return std::nullopt;
+  }
+
+  size_t existing_slot = 0;
+  uint32_t existing_crc = 0;
+  if (caches_[shard_id]->get_offset_and_crc(hash, existing_slot, existing_crc)) {
+    if (existing_crc != 0 && data_crc != 0 && existing_crc != data_crc) {
+      caches_[shard_id]->remove(hash);
+
+      result = -1;
+      evicted_hash.clear();
+      for (int attempt = 0; attempt < 64; ++attempt) {
+        result = caches_[shard_id]->acquire_slot(hash, slot_id, evicted_hash);
+        if (result >= 0) {
+          break;
+        }
+        std::this_thread::yield();
+      }
+      if (result < 0) {
+        return static_cast<size_t>(0);
+      }
+    } else if (existing_crc == 0 && data_crc != 0) {
+      caches_[shard_id]->mark_ready(hash, data_crc);
+    }
+  }
+
+  if (result == 0) {
+    if (do_global_dedupe) {
+      size_t duplicate_slot = 0;
+      uint32_t duplicate_crc = 0;
+      if (caches_[shard_id]->get_offset_and_crc(hash, duplicate_slot, duplicate_crc)) {
+        const std::string shard_slot = std::to_string(shard_id) + ":" + std::to_string(duplicate_slot);
+        std::vector<std::vector<std::string>> cmds;
+        cmds.reserve(duplicate_crc != 0 ? 3 : 2);
+        cmds.push_back({"HSET", redis_lock_->shardIndexKey(shard_id), hash, std::to_string(duplicate_slot)});
+        cmds.push_back({"HSET", global_key, hash, shard_slot});
+        if (duplicate_crc != 0) {
+          cmds.push_back({"HSET", redis_lock_->globalCrcKey(), hash, std::to_string(duplicate_crc)});
+        }
+        (void)redis_lock_->pipeline(cmds);
+      }
+    }
+    return block_size_;
+  }
+
+  return std::nullopt;
 }
 
 size_t LocalStorageEngine::write(const char *buf, const std::string &hash, uint32_t data_crc, uint32_t len_bytes) {
@@ -255,15 +303,12 @@ size_t LocalStorageEngine::write(const char *buf, const std::string &hash, uint3
   }
 
   // Offline mode (local cache):
-  // Keep the write hot path lightweight.
   // Online mode requires durability/consistency (WAL + CRC + fsync + fencing).
   if (!online_mode_) {
     const size_t shard_id = getShard(hash);
     if (shard_id >= shard_) {
       return 0;
     }
-
-    auto inflight_guard = shard_inflight_[shard_id].acquire();
 
     size_t slot_id = 0;
     std::string evicted_hash;
@@ -293,8 +338,6 @@ size_t LocalStorageEngine::write(const char *buf, const std::string &hash, uint3
       if (!pwriteAll(file_fds_[shard_id], buf, static_cast<size_t>(len_bytes), static_cast<off_t>(offset_bytes))) {
         throw std::runtime_error("pwrite failed, errno=" + std::to_string(errno));
       }
-      // Intentionally do not fdatasync/fsync in offline mode: this is a cache, not a database.
-      // Avoid turning every block write into a durability barrier.
     } catch (const std::exception &e) {
       std::fprintf(stderr, "[light_mem error] write(offline): I/O failed (shard=%zu hash=%s): %s\n",
                    shard_id, hash.c_str(), e.what());
@@ -343,24 +386,22 @@ size_t LocalStorageEngine::write(const char *buf, const std::string &hash, uint3
   // Track whether we hold the distributed Redis lock for this hash.
   bool lock_held = false;
   if (do_global_dedupe) {
-    // Redis global-index hit is not always a valid dedupe signal: after local cache reset,
-    // Redis may still contain stale mappings. For mappings that point to shards writable on
-    // this node, require local presence (and CRC match when available) before deduping.
+    // 返回true就跳过写入(去重), 返回false继续写入并覆盖原数据
     auto shouldDedupeGlobalHit = [&](const std::string &mapping) -> bool {
       const auto pos = mapping.find(':');
       if (pos == std::string::npos) {
-        return true;
+        return false;
       }
 
       size_t mapped_shard = 0;
       try {
         mapped_shard = static_cast<size_t>(std::stoull(mapping.substr(0, pos)));
       } catch (...) {
-        return true;
+        return false;
       }
 
       if (mapped_shard >= shard_) {
-        return true;
+        return false;
       }
 
       // If this node doesn't currently own/write the shard, keep global dedupe behavior.
@@ -436,56 +477,11 @@ size_t LocalStorageEngine::write(const char *buf, const std::string &hash, uint3
     return 0;
   }
 
-  // If the hash already exists locally, we normally treat it as a dedupe hit.
-  // However, users may reuse the same hash across runs with different in-memory content
-  if (result == 0) {
-    size_t existing_slot = 0;
-    uint32_t existing_crc = 0;
-    if (caches_[shard_id]->get_offset_and_crc(hash, existing_slot, existing_crc)) {
-      if (existing_crc != 0 && data_crc != 0 && existing_crc != data_crc) {
-        // Content differs: drop the old mapping and retry slot acquisition so we overwrite on disk.
-        caches_[shard_id]->remove(hash);
-
-        // Retry acquire_slot() once (with congestion retries).
-        result = -1;
-        evicted_hash.clear();
-        for (int attempt = 0; attempt < 64; ++attempt) {
-          result = caches_[shard_id]->acquire_slot(hash, slot_id, evicted_hash);
-          if (result >= 0) {
-            break;
-          }
-          std::this_thread::yield();
-        }
-        if (result < 0) {
-          return 0;
-        }
-      } else if (existing_crc == 0 && data_crc != 0) {
-        // Best-effort: populate local CRC if it was missing.
-        caches_[shard_id]->mark_ready(hash, data_crc);
-      }
-    }
-  }
-
-  if (result == 0) {
-    // Local duplicate: data already on disk.
-    // In online mode, repopulate Redis mappings if the entry is ready.
-    // If another thread is still writing (not ready), it will push to Redis via journal worker.
-    if (do_global_dedupe) {
-      size_t existing_slot = 0;
-      uint32_t existing_crc = 0;
-      if (caches_[shard_id]->get_offset_and_crc(hash, existing_slot, existing_crc)) {
-        const std::string shard_slot = std::to_string(shard_id) + ":" + std::to_string(existing_slot);
-        std::vector<std::vector<std::string>> cmds;
-        cmds.reserve(existing_crc != 0 ? 3 : 2);
-        cmds.push_back({"HSET", redis_lock_->shardIndexKey(shard_id), hash, std::to_string(existing_slot)});
-        cmds.push_back({"HSET", global_key, hash, shard_slot});
-        if (existing_crc != 0) {
-          cmds.push_back({"HSET", redis_lock_->globalCrcKey(), hash, std::to_string(existing_crc)});
-        }
-        (void)redis_lock_->pipeline(cmds);
-      }
-    }
-    return block_size_;
+  if (auto duplicate_result =
+          handleExistingLocalDuplicate(shard_id, hash, data_crc, result, slot_id, evicted_hash, do_global_dedupe,
+                                       global_key);
+      duplicate_result.has_value()) {
+    return *duplicate_result;
   }
 
   // If LRU evicted something, delete its Redis mappings *before* we overwrite the slot.
@@ -513,13 +509,6 @@ size_t LocalStorageEngine::write(const char *buf, const std::string &hash, uint3
   } catch (const std::exception &e) {
     std::fprintf(stderr, "[light_mem error] write: I/O failed (shard=%zu hash=%s): %s\n",
                  shard_id, hash.c_str(), e.what());
-    caches_[shard_id]->remove(hash);
-    return 0;
-  }
-
-  // Fence again after data is durable (handles revocation mid-write).
-  uint64_t epoch2 = 0;
-  if (!isShardWritable(shard_id, &epoch2) || epoch2 != epoch) {
     caches_[shard_id]->remove(hash);
     return 0;
   }
@@ -559,10 +548,6 @@ size_t LocalStorageEngine::write(const char *buf, const std::string &hash, uint3
 #endif
 
   return write_bytes;
-}
-
-size_t LocalStorageEngine::read(char *buf, const std::string &hash) {
-  return read(buf, hash, static_cast<uint32_t>(block_size_));
 }
 
 size_t LocalStorageEngine::read(char *buf, const std::string &hash, uint32_t len_bytes) {
@@ -630,7 +615,9 @@ size_t LocalStorageEngine::read(char *buf, const std::string &hash, uint32_t len
   if (expected_crc != 0) {
     const size_t offset_bytes = slot_id * block_size_;
     if (!preadAll(file_fds_[shard_id], buf, static_cast<size_t>(len_bytes), static_cast<off_t>(offset_bytes))) {
-      return 0; // I/O error; keep Redis mappings intact.
+      std::fprintf(stderr, "[light_mem error] read: I/O error for hash %s (shard=%zu slot=%zu)\n",
+                   hash.c_str(), shard_id, slot_id);
+      return 0;
     }
     if (compute_crc32(buf, static_cast<size_t>(len_bytes)) == expected_crc) {
       return static_cast<size_t>(len_bytes);

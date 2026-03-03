@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <sstream>
 #include <stdexcept>
 #include <vector>
 

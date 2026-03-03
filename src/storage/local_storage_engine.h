@@ -3,7 +3,6 @@
 #include "storage/local_cache_index.h"
 #include "storage/local_storage_wal.h"
 #include "storage/redis_client.h"
-#include "storage/storage_engine.h"
 
 #include <array>
 #include <atomic>
@@ -26,7 +25,7 @@
 namespace cache {
 namespace storage {
 
-class LocalStorageEngine : public StorageEngine {
+class LocalStorageEngine {
 public:
   struct HashInfo {
     std::vector<std::shared_ptr<LocalCacheIndex>> caches;
@@ -53,14 +52,10 @@ public:
 
   LocalStorageEngine(const std::string &filename, size_t storage_size, size_t shard, size_t block_size,
                      const std::string &index_endpoint, const std::string &index_prefix = std::string());
-  ~LocalStorageEngine() override;
+  ~LocalStorageEngine();
 
   // Batch query variant for high-throughput callers.
-  std::vector<bool> queryMany(const std::vector<std::string> &hashs) override;
-  // StorageEngine overrides keep legacy semantics (full block_size_ I/O and CRC).
-  size_t write(const char *buf, const std::string &hash) override;
-  size_t read(char *buf, const std::string &hash) override;
-
+  std::vector<bool> queryMany(const std::vector<std::string> &hashs);
   // Length-aware variants used by the cache service.
   size_t write(const char *buf, const std::string &hash, uint32_t data_crc, uint32_t len_bytes);
   size_t read(char *buf, const std::string &hash, uint32_t len_bytes);
@@ -101,6 +96,9 @@ private:
   bool isShardWritable(size_t shard_id, uint64_t *epoch_out = nullptr) const;
   std::optional<size_t> findShardInRedis(const std::string &hash, size_t *slot_id_out);
   size_t pickWritableShard(const std::string &hash) const;
+  std::optional<size_t> handleExistingLocalDuplicate(size_t shard_id, const std::string &hash, uint32_t data_crc,
+                                                     int &result, size_t &slot_id, std::string &evicted_hash,
+                                                     bool do_global_dedupe, const std::string &global_key);
 
   struct InflightCounter {
     struct Guard {
