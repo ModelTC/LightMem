@@ -11,7 +11,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -20,6 +23,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <zlib.h> // crc32
 
 using namespace std;
 using namespace cache::task;
@@ -45,11 +50,10 @@ public:
    * @param num_workers Number of worker threads
    */
   LocalCacheService(const string &file, size_t storage_size, size_t num_shard, const torch::Tensor &kvcache,
-                    const size_t num_workers)
-      : CacheService(kvcache), stop_(false), num_workers_(num_workers), block_size_(0), total_written_bytes_(0),
-        first_write_time_ticks_(0), last_write_time_ticks_(0), last_log_time_(), last_logged_bytes_(0),
-        total_read_bytes_(0), first_read_time_ticks_(0), last_read_time_ticks_(0), read_last_log_time_(),
-        read_last_logged_bytes_(0) {
+                    const size_t num_workers, const std::string &index_endpoint = "", bool bandwidth_log = true,
+                    const std::string &index_prefix = "")
+      : CacheService(kvcache), stop_(false), num_workers_(num_workers), block_size_(0), bandwidth_log_(bandwidth_log),
+        online_mode_(!index_endpoint.empty()) {
     block_size_ = static_cast<size_t>(this->block_size());
 
     if (storage_size < block_size_) {
@@ -58,7 +62,7 @@ public:
 
     ensure_disk_capacity(file, storage_size, num_shard);
 
-    storage_ = make_unique<LocalStorageEngine>(file, storage_size, num_shard, block_size_);
+    storage_ = make_unique<LocalStorageEngine>(file, storage_size, num_shard, block_size_, index_endpoint, index_prefix);
 
     // Use unique_ptr for exception safety - if any allocation fails, previous allocations are automatically cleaned up
     r_cpu_buffers_.reserve(num_workers_);
@@ -90,11 +94,90 @@ public:
    * This function will throw no exception or error.
    */
   std::vector<bool> query(const std::vector<std::string> &hashs) override {
-    std::vector<bool> ret;
-    ret.reserve(hashs.size());
-    std::transform(hashs.begin(), hashs.end(), std::back_inserter(ret),
-                   [this](const auto &hash) { return storage_->query(hash); });
-    return ret;
+    if (!storage_) {
+      return std::vector<bool>(hashs.size(), false);
+    }
+    return storage_->queryMany(hashs);
+  }
+
+  /**
+   * @brief Update this node's shard assignment state in online/distributed mode.
+   *
+   * @param shard_ids Shard IDs owned/managed by this node.
+   * @param epochs    Per-shard epoch (generation). Must align 1:1 with shard_ids.
+   * @param draining  Per-shard draining flag (0/1). If 1, shard is treated as not writable (no new writes).
+   *
+   * Requirements: shard_ids/epochs/draining must have the same length.
+   */
+  void update_shard_assignments(const std::vector<size_t> &shard_ids, const std::vector<uint64_t> &epochs,
+                                const std::vector<uint8_t> &draining) {
+    if (!storage_) {
+      return;
+    }
+    storage_->updateShardAssignments(shard_ids, epochs, draining);
+  }
+
+  /**
+   * @brief Rebuild Redis index for a shard from local snapshot + WAL.
+   *
+   * Intended to be called when a node (re-)acquires write permission for a shard.
+   */
+  void recover_shard_to_redis(size_t shard_id) {
+    if (!storage_) {
+      return;
+    }
+    storage_->recoverShardToRedis(shard_id);
+  }
+
+  /**
+   * @brief Recover Redis index for a shard using smart policy (full vs incremental).
+   */
+  void recover_shard_to_redis_smart(size_t shard_id) {
+    if (!storage_) {
+      return;
+    }
+    storage_->recoverShardToRedisSmart(shard_id);
+  }
+
+  /**
+   * @brief Observability: current in-flight write operations for a shard.
+   *
+   * This is a best-effort counter used by the coordinator/control-plane to decide when a shard is drained.
+   */
+  uint32_t shard_inflight(size_t shard_id) const {
+    if (!storage_) {
+      return 0;
+    }
+    return storage_->shardInflight(shard_id);
+  }
+
+  uint64_t shard_written_bytes(size_t shard_id) const {
+    if (!storage_) {
+      return 0;
+    }
+    return storage_->shardWrittenBytes(shard_id);
+  }
+
+  // True LRU eviction observability (local to this node).
+  uint64_t shard_eviction_count(size_t shard_id) const {
+    if (!storage_) {
+      return 0;
+    }
+    return storage_->shardEvictionCount(shard_id);
+  }
+
+  uint64_t eviction_count() const {
+    if (!storage_) {
+      return 0;
+    }
+    return storage_->evictionCount();
+  }
+
+  bool eviction_observed() const {
+    if (!storage_) {
+      return false;
+    }
+    return storage_->evictionObserved();
   }
 
   /**
@@ -108,7 +191,13 @@ public:
   }
 
 protected:
+  bool online_mode() const override { return online_mode_; }
+
   void on_task_finalized(const std::shared_ptr<cache::task::CacheTask> &task) override {
+    if (!bandwidth_log_) {
+      return;
+    }
+
     if (task->operation_mode == cache::task::Mode::Write) {
       // Try to acquire the lock, skip logging if contention occurs
       std::unique_lock<std::mutex> guard(log_mutex_, std::try_to_lock);
@@ -123,8 +212,9 @@ protected:
 
       const auto now = std::chrono::steady_clock::now();
       if (last_log_time_ != std::chrono::steady_clock::time_point{}) {
-        const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time_);
-        if (elapsed < std::chrono::seconds(3)) {
+        const double elapsed_sec =
+            std::chrono::duration_cast<std::chrono::duration<double>>(now - last_log_time_).count();
+        if (elapsed_sec < 3.0) {
           return;
         }
       }
@@ -133,25 +223,14 @@ protected:
       const uint64_t delta_bytes = (total >= previous_bytes) ? (total - previous_bytes) : 0;
       double speed_gbps = 0.0;
 
-      // Use actual I/O time for speed calculation
+      // IMPORTANT: use wall-clock delta between log prints.
+      // Summing per-task (create()->ready()) durations double-counts time under concurrency,
+      // which makes the reported speed much smaller than the actual byte growth.
       if (last_log_time_ != std::chrono::steady_clock::time_point{}) {
         const double elapsed_sec =
             std::chrono::duration_cast<std::chrono::duration<double>>(now - last_log_time_).count();
         if (elapsed_sec > 0.0) {
           speed_gbps = (static_cast<double>(delta_bytes) / (1024.0 * 1024.0 * 1024.0)) / elapsed_sec;
-        }
-      } else {
-        // For the first log, use time from first write start to now
-        const int64_t first_ticks = first_write_time_ticks_.load(std::memory_order_relaxed);
-        if (first_ticks != 0) {
-          const auto first_duration =
-              std::chrono::steady_clock::duration(static_cast<std::chrono::steady_clock::duration::rep>(first_ticks));
-          const auto first_time = std::chrono::steady_clock::time_point(first_duration);
-          const double elapsed_sec =
-              std::chrono::duration_cast<std::chrono::duration<double>>(now - first_time).count();
-          if (elapsed_sec > 0.0) {
-            speed_gbps = (static_cast<double>(delta_bytes) / (1024.0 * 1024.0 * 1024.0)) / elapsed_sec;
-          }
         }
       }
 
@@ -159,63 +238,81 @@ protected:
       last_logged_bytes_ = total;
 
       const double total_gb = static_cast<double>(total) / (1024.0 * 1024.0 * 1024.0);
-      printf("[light_mem] cumulative disk write size: %.2f GB, recent write speed: %.2f GB/s\n", total_gb, speed_gbps);
+
+      const size_t owned_shards = storage_->ownedShardCount();
+      const uint64_t effective_bytes = storage_->effectiveWritableCapacityBytes();
+      const double effective_gb = static_cast<double>(effective_bytes) / (1024.0 * 1024.0 * 1024.0);
+      const bool evict = storage_->evictionObserved();
+
+      std::fprintf(stderr,
+                   "[light_mem] cumulative disk write size: %.2f GB, recent write speed: %.2f GB/s, owned_shards: %zu, "
+                   "effective_write_capacity: %.2f GB, evict: %s\n",
+                   total_gb, speed_gbps, owned_shards, effective_gb, evict ? "True" : "False");
+      std::fflush(stderr);
       return;
     }
 
     if (task->operation_mode != cache::task::Mode::Read) {
       return;
     }
+
+    // Track end-to-end read window (create() -> ready()) using min(start) and max(end).
+    // This avoids summing per-task durations (which double-counts time under concurrency).
+    const int64_t start_ticks = task->submit_time_ticks.load(std::memory_order_relaxed);
+    const int64_t end_ticks = task->finish_time_ticks.load(std::memory_order_relaxed);
+    if (start_ticks != 0 && end_ticks != 0 && end_ticks > start_ticks) {
+      // window_read_start_ticks_ = min(window_read_start_ticks_, start_ticks)
+      int64_t cur = window_read_start_ticks_.load(std::memory_order_relaxed);
+      while (cur == 0 || start_ticks < cur) {
+        if (window_read_start_ticks_.compare_exchange_weak(cur, start_ticks, std::memory_order_relaxed,
+                                                          std::memory_order_relaxed)) {
+          break;
+        }
+      }
+
+      // window_read_end_ticks_ = max(window_read_end_ticks_, end_ticks)
+      cur = window_read_end_ticks_.load(std::memory_order_relaxed);
+      while (end_ticks > cur) {
+        if (window_read_end_ticks_.compare_exchange_weak(cur, end_ticks, std::memory_order_relaxed,
+                                                        std::memory_order_relaxed)) {
+          break;
+        }
+      }
+    }
+
     if (active_read_creates_.load(std::memory_order_relaxed) != 0) {
       return;
     }
 
     std::lock_guard<std::mutex> guard(read_log_mutex_);
 
-    const uint64_t total_read = total_read_bytes_.load(std::memory_order_relaxed);
-    if (total_read == 0) {
+    if (active_read_creates_.load(std::memory_order_relaxed) != 0) {
       return;
     }
 
-    // Calculate batch read amount (since last queue empty)
-    const uint64_t previous_read = read_last_logged_bytes_;
-    const uint64_t delta_read = (total_read >= previous_read) ? (total_read - previous_read) : 0;
-    if (delta_read == 0) {
+    const uint64_t window_bytes = total_read_bytes_.exchange(0, std::memory_order_relaxed);
+    const int64_t window_start = window_read_start_ticks_.exchange(0, std::memory_order_relaxed);
+    const int64_t window_end = window_read_end_ticks_.exchange(0, std::memory_order_relaxed);
+    if (window_bytes == 0 || window_start == 0 || window_end == 0 || window_end <= window_start) {
       return;
     }
 
-    // Use actual I/O time: from first read start to last read completion
-    const int64_t first_ticks = first_read_time_ticks_.load(std::memory_order_relaxed);
-    const int64_t last_ticks = last_read_time_ticks_.load(std::memory_order_relaxed);
-
-    double speed_gbps = 0.0;
-    if (first_ticks != 0 && last_ticks != 0 && last_ticks > first_ticks) {
-      const auto first_duration =
-          std::chrono::steady_clock::duration(static_cast<std::chrono::steady_clock::duration::rep>(first_ticks));
-      const auto last_duration =
-          std::chrono::steady_clock::duration(static_cast<std::chrono::steady_clock::duration::rep>(last_ticks));
-      const auto first_time = std::chrono::steady_clock::time_point(first_duration);
-      const auto last_time = std::chrono::steady_clock::time_point(last_duration);
-      const double elapsed_sec =
-          std::chrono::duration_cast<std::chrono::duration<double>>(last_time - first_time).count();
-      if (elapsed_sec > 0.0) {
-        speed_gbps = (static_cast<double>(delta_read) / (1024.0 * 1024.0 * 1024.0)) / elapsed_sec;
-      }
+    const int64_t elapsed_ticks = window_end - window_start;
+    const auto elapsed_dur =
+        std::chrono::steady_clock::duration(static_cast<std::chrono::steady_clock::duration::rep>(elapsed_ticks));
+    const double elapsed_sec = std::chrono::duration_cast<std::chrono::duration<double>>(elapsed_dur).count();
+    if (elapsed_sec <= 0.0) {
+      return;
     }
 
+    const double window_gb = static_cast<double>(window_bytes) / (1024.0 * 1024.0 * 1024.0);
+    const double speed_gbps = window_gb / elapsed_sec;
     if (speed_gbps <= 0.0) {
       return;
     }
 
-    const double delta_read_gb = static_cast<double>(delta_read) / (1024.0 * 1024.0 * 1024.0);
-
-    // Reset counters for next batch after queue is empty
-    read_last_log_time_ = std::chrono::steady_clock::now();
-    read_last_logged_bytes_ = 0;                                // Reset to 0 instead of total_read
-    total_read_bytes_.store(0, std::memory_order_relaxed);      // Clear accumulated bytes
-    first_read_time_ticks_.store(0, std::memory_order_relaxed); // Reset timing
-    last_read_time_ticks_.store(0, std::memory_order_relaxed);  // Reset timing
-    printf("[light_mem] batch read size: %.2f GB, read speed: %.2f GB/s\n", delta_read_gb, speed_gbps);
+    std::fprintf(stderr, "[light_mem] batch read size: %.2f GB, read speed: %.2f GB/s\n", window_gb, speed_gbps);
+    std::fflush(stderr);
   }
 
 private:
@@ -290,13 +387,14 @@ private:
                                                      std::memory_order_relaxed);
     }
 
-    const size_t read_bytes = storage_->read(cpu_buffer, block->hash);
-    if (read_bytes != block_size_) {
+    const uint32_t logical_bytes = static_cast<uint32_t>(num_of_page * this->cache_info_.page_size);
+    const size_t read_bytes = storage_->read(cpu_buffer, block->hash, logical_bytes);
+    if (read_bytes != static_cast<size_t>(logical_bytes)) {
       // Only log if it's a real I/O error (partial read), not cache miss (read_bytes == 0)
       if (read_bytes != 0) {
         fprintf(stderr,
-                "[light_mem error] handleReadCpu: partial read for hash %s, expected %zu bytes, got %zu bytes\n",
-                block->hash.c_str(), block_size_, read_bytes);
+                "[light_mem error] handleReadCpu: partial read for hash %s, expected %u bytes, got %zu bytes\n",
+                block->hash.c_str(), logical_bytes, read_bytes);
       }
       return false;
     }
@@ -330,34 +428,87 @@ private:
                                                       std::memory_order_relaxed);
     }
 
-    // Step 1: Gather data from KV cache to temporary buffer
-    cpu_gather(this->cache_info_, cpu_buffer, page_ptr, num_of_page);
+    const uint32_t logical_bytes = static_cast<uint32_t>(num_of_page * this->cache_info_.page_size);
+
+    // Step 1: Gather data from KV cache to temporary buffer.
+    // Online mode: fuse CRC with memcpy (cache-friendly) so the storage layer doesn't
+    //   need a separate full-block CRC pass.
+    // Offline mode: CRC is never used (mark_ready passes 0), so skip it entirely
+    //   to avoid wasting memory bandwidth on a ~1 MB CRC that gets discarded.
+    uint32_t data_crc = 0;
+    if (online_mode_) {
+      data_crc = cpu_gather_crc32(this->cache_info_, cpu_buffer, page_ptr, num_of_page);
+    } else {
+      cpu_gather(this->cache_info_, cpu_buffer, page_ptr, num_of_page);
+    }
 
     // Critical optimization: Mark data as ready immediately after gather completes
     // This allows Python layer to release pages without waiting for disk I/O
     task->num_data_ready_blocks.fetch_add(1, std::memory_order_release);
 
     // Step 2: Write to disk (this happens asynchronously and doesn't block page release)
-    const size_t written = storage_->write(cpu_buffer, block->hash);
+    // Always use the length-aware write path to skip redundant CRC recomputation.
+    const size_t written = storage_->write(cpu_buffer, block->hash, data_crc, logical_bytes);
 
     // Handle different write results:
-    // - written == block_size_: Success, new data written
+    // - written > 0: Success (len_bytes for offline, block_size_ for online)
     // - written == 0: Skipped (already exists, failed, or temporary congestion)
-    // - other values: Partial write error (should not happen)
-    if (written != block_size_ && written != 0) {
+    if (written != 0 && written != static_cast<size_t>(logical_bytes) && written != block_size_) {
       fprintf(stderr,
-              "[light_mem error] handleWriteCpu: partial write for hash %s, expected %zu or 0 bytes, got %zu bytes\n",
-              block->hash.c_str(), block_size_, written);
+              "[light_mem error] handleWriteCpu: unexpected write size for hash %s, expected %u or %zu or 0 bytes, got %zu bytes\n",
+              block->hash.c_str(), logical_bytes, block_size_, written);
       return false;
     }
 
-    // If written == 0, it means:
-    // 1. Hash already exists (deduplication)
-    // 2. Temporary failure (all slots busy, I/O error)
-    // 3. Write was skipped
-    // This is acceptable for cache operations - treat as success to avoid abort
-    if (written == block_size_) {
-      total_written_bytes_.fetch_add(static_cast<uint64_t>(written), std::memory_order_relaxed);
+    // If written == 0:
+    // - Offline mode: treat as failure (avoid silent data loss).
+    // - Online mode: tolerate short transient ownership migration windows with retries.
+    size_t final_written = written;
+    if (final_written == 0) {
+      if (!online_mode()) {
+        return false;
+      }
+
+      bool readable = false;
+      constexpr int kRetry = 3;
+      for (int attempt = 0; attempt <= kRetry; ++attempt) {
+        // Verify existence on slow-path: dedupe hit or already-published data should be readable.
+        const auto exists = storage_->queryMany(std::vector<std::string>{block->hash});
+        if (!exists.empty() && exists[0]) {
+          readable = true;
+          break;
+        }
+
+        if (attempt == kRetry) {
+          break;
+        }
+
+        // Retry write for transient ownership handoff/draining windows.
+        std::this_thread::yield();
+        final_written = storage_->write(cpu_buffer, block->hash, data_crc, logical_bytes);
+
+        if (final_written != 0 && final_written != static_cast<size_t>(logical_bytes) && final_written != block_size_) {
+          fprintf(stderr,
+                  "[light_mem error] handleWriteCpu: unexpected retry write size for hash %s, expected %u or %zu or 0 bytes, got %zu bytes\n",
+                  block->hash.c_str(), logical_bytes, block_size_, final_written);
+          return false;
+        }
+
+        if (final_written > 0) {
+          break;
+        }
+      }
+
+      if (final_written == 0 && !readable) {
+        std::fprintf(
+            stderr,
+            "[light_mem warning] handleWriteCpu: transient write miss (possibly shard migration), hash not readable after retries: %s\n",
+            block->hash.c_str());
+        return false;
+      }
+    }
+    if (final_written > 0) {
+      total_written_bytes_.fetch_add(static_cast<uint64_t>(final_written), std::memory_order_relaxed);
     }
 
     // Record end time after write completes
@@ -387,6 +538,32 @@ private:
     const int64_t page_stride = info.page_stride;
     const int64_t total_pages = info.num_of_page;
     const int64_t page_bytes = page_size;
+
+    // Fast path: if destination pages are contiguous in memory and indices form a contiguous range,
+    // we can copy the entire span in one memcpy.
+    if (num_of_page > 0 && page_stride == page_bytes) {
+      const int32_t first = page_idx[0];
+      if (first < 0 || first >= total_pages) {
+        throw std::runtime_error("kv page index out of range in cpu_scatter.");
+      }
+      bool contiguous = true;
+      for (int64_t local_page = 1; local_page < num_of_page; ++local_page) {
+        const int32_t expected = first + static_cast<int32_t>(local_page);
+        if (page_idx[local_page] != expected) {
+          contiguous = false;
+          break;
+        }
+      }
+      if (contiguous) {
+        const int32_t last = first + static_cast<int32_t>(num_of_page - 1);
+        if (last < 0 || last >= total_pages) {
+          throw std::runtime_error("kv page index out of range in cpu_scatter.");
+        }
+        char *dst_ptr = info.base_ptr + static_cast<int64_t>(first) * page_stride;
+        std::memcpy(dst_ptr, block, static_cast<size_t>(num_of_page) * static_cast<size_t>(page_bytes));
+        return;
+      }
+    }
 
     for (int64_t local_page = 0; local_page < num_of_page; ++local_page) {
       const int32_t dst_page = page_idx[local_page];
@@ -421,6 +598,32 @@ private:
     const int64_t total_pages = info.num_of_page;
     const int64_t page_bytes = page_size;
 
+    // Fast path: if source pages are contiguous in memory and indices form a contiguous range,
+    // we can gather the entire span in one memcpy.
+    if (num_of_page > 0 && page_stride == page_bytes) {
+      const int32_t first = page_idx[0];
+      if (first < 0 || first >= total_pages) {
+        throw std::runtime_error("kv page index out of range in cpu_gather.");
+      }
+      bool contiguous = true;
+      for (int64_t local_page = 1; local_page < num_of_page; ++local_page) {
+        const int32_t expected = first + static_cast<int32_t>(local_page);
+        if (page_idx[local_page] != expected) {
+          contiguous = false;
+          break;
+        }
+      }
+      if (contiguous) {
+        const int32_t last = first + static_cast<int32_t>(num_of_page - 1);
+        if (last < 0 || last >= total_pages) {
+          throw std::runtime_error("kv page index out of range in cpu_gather.");
+        }
+        const char *src_ptr = info.base_ptr + static_cast<int64_t>(first) * page_stride;
+        std::memcpy(block, src_ptr, static_cast<size_t>(num_of_page) * static_cast<size_t>(page_bytes));
+        return;
+      }
+    }
+
     for (int64_t local_page = 0; local_page < num_of_page; ++local_page) {
       const int32_t src_page = page_idx[local_page];
       if (src_page < 0 || src_page >= total_pages) {
@@ -434,26 +637,87 @@ private:
     }
   }
 
-  size_t block_size_;                                   ///< Block size
-  unique_ptr<LocalStorageEngine> storage_;              ///< Local storage engine
-  vector<thread> workers_;                              ///< Worker threads
-  bool stop_;                                           ///< Thread stop flag
-  size_t num_workers_;                                  ///< Number of worker threads
-  vector<unique_ptr<char[]>> r_cpu_buffers_;            ///< CPU buffers for read worker (RAII managed)
-  vector<unique_ptr<char[]>> w_cpu_buffers_;            ///< CPU buffers for write worker (RAII managed)
-  std::atomic<uint64_t> total_written_bytes_;           ///< Total bytes written to disk
-  std::atomic<int64_t> first_write_time_ticks_;         ///< First write start time in steady clock ticks
-  std::atomic<int64_t> last_write_time_ticks_;          ///< Last write completion time in steady clock ticks
-  std::mutex log_mutex_;                                ///< Protects write rate reporting
-  std::chrono::steady_clock::time_point last_log_time_; ///< Last write log timestamp
-  uint64_t last_logged_bytes_;                          ///< Bytes recorded at last write log
+  // Gather + CRC in one pass (CRC over the logical bytes only: num_of_page * page_size).
+  static uint32_t cpu_gather_crc32(const CacheParam_t &info, char *block, const int32_t *page_idx,
+                                  int64_t num_of_page) {
+    const int64_t page_size = info.page_size;
+    const int64_t page_stride = info.page_stride;
+    const int64_t total_pages = info.num_of_page;
+    const int64_t page_bytes = page_size;
 
-  std::atomic<uint64_t> total_read_bytes_;                   ///< Total bytes read from disk
-  std::atomic<int64_t> first_read_time_ticks_;               ///< First read start time in steady clock ticks
-  std::atomic<int64_t> last_read_time_ticks_;                ///< Last read completion time in steady clock ticks
-  std::mutex read_log_mutex_;                                ///< Protects read rate reporting
-  std::chrono::steady_clock::time_point read_last_log_time_; ///< Last read log timestamp
-  uint64_t read_last_logged_bytes_;                          ///< Bytes recorded at last read log
+    uLong crc = ::crc32(0, Z_NULL, 0);
+
+    // Fast path: if source pages are contiguous in memory and indices form a contiguous range.
+    if (num_of_page > 0 && page_stride == page_bytes) {
+      const int32_t first = page_idx[0];
+      if (first < 0 || first >= total_pages) {
+        throw std::runtime_error("kv page index out of range in cpu_gather_crc32.");
+      }
+      bool contiguous = true;
+      for (int64_t local_page = 1; local_page < num_of_page; ++local_page) {
+        const int32_t expected = first + static_cast<int32_t>(local_page);
+        if (page_idx[local_page] != expected) {
+          contiguous = false;
+          break;
+        }
+      }
+      if (contiguous) {
+        const int32_t last = first + static_cast<int32_t>(num_of_page - 1);
+        if (last < 0 || last >= total_pages) {
+          throw std::runtime_error("kv page index out of range in cpu_gather_crc32.");
+        }
+        const char *src_ptr = info.base_ptr + static_cast<int64_t>(first) * page_stride;
+        const size_t nbytes = static_cast<size_t>(num_of_page) * static_cast<size_t>(page_bytes);
+        std::memcpy(block, src_ptr, nbytes);
+        crc = ::crc32(crc, reinterpret_cast<const Bytef *>(src_ptr), nbytes);
+        return static_cast<uint32_t>(crc);
+      }
+    }
+
+    for (int64_t local_page = 0; local_page < num_of_page; ++local_page) {
+      const int32_t src_page = page_idx[local_page];
+      if (src_page < 0 || src_page >= total_pages) {
+        throw std::runtime_error("kv page index out of range in cpu_gather_crc32.");
+      }
+
+      const char *src_page_ptr = info.base_ptr + static_cast<int64_t>(src_page) * page_stride;
+      char *dst_page_ptr = block + local_page * page_bytes;
+      std::memcpy(dst_page_ptr, src_page_ptr, page_bytes);
+      crc = ::crc32(crc, reinterpret_cast<const Bytef *>(src_page_ptr), static_cast<size_t>(page_bytes));
+    }
+    return static_cast<uint32_t>(crc);
+  }
+
+  size_t block_size_;                        ///< Block size
+  unique_ptr<LocalStorageEngine> storage_;   ///< Local storage engine
+  vector<thread> workers_;                   ///< Worker threads
+  bool stop_;                                ///< Thread stop flag
+  size_t num_workers_;                       ///< Number of worker threads
+  vector<unique_ptr<char[]>> r_cpu_buffers_; ///< CPU buffers for read worker (RAII managed)
+  vector<unique_ptr<char[]>> w_cpu_buffers_; ///< CPU buffers for write worker (RAII managed)
+
+  bool bandwidth_log_{true};
+  bool online_mode_{false};
+
+  std::atomic<uint64_t> total_written_bytes_{0};
+  std::atomic<uint64_t> window_logical_written_bytes_{0};
+  std::atomic<int64_t> window_logical_write_time_ticks_{0};
+  std::atomic<int64_t> first_write_time_ticks_{0};
+  std::atomic<int64_t> last_write_time_ticks_{0};
+  std::mutex log_mutex_;
+  std::chrono::steady_clock::time_point last_log_time_{};
+  uint64_t last_logged_bytes_{0};
+
+  std::atomic<uint64_t> total_read_bytes_{0};
+  std::atomic<uint64_t> window_logical_read_bytes_{0};
+  std::atomic<int64_t> window_logical_read_time_ticks_{0};
+  std::atomic<int64_t> window_read_start_ticks_{0};
+  std::atomic<int64_t> window_read_end_ticks_{0};
+  std::atomic<int64_t> first_read_time_ticks_{0};
+  std::atomic<int64_t> last_read_time_ticks_{0};
+  std::mutex read_log_mutex_;
+  std::chrono::steady_clock::time_point read_last_log_time_{};
+  uint64_t read_last_logged_bytes_{0};
 
   // Ensure the backing storage path exposes enough disk capacity for the requested cache size.
   static void ensure_disk_capacity(const string &file, size_t storage_size, size_t num_shard) {

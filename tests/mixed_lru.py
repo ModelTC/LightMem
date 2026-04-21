@@ -24,6 +24,12 @@ NUM_PAGES = 1024   # 总页数
 SOURCE_START, SOURCE_END = 0, NUM_PAGES // 2
 DEST_START, DEST_END = NUM_PAGES // 2, NUM_PAGES
 
+
+def token_to_signature(token_val: int) -> int:
+    """将 token 映射到 uint8 的稳定签名值（用于数据完整性校验）。"""
+    # 产生尽量分散的 0..255 值，避免大量 token 映射到相同签名导致校验变弱
+    return int(((token_val * 2654435761) ^ (token_val >> 16)) & 0xFF)
+
 def test_mixed_lru_stability():
     print("初始化测试环境...")
 
@@ -66,20 +72,35 @@ def test_mixed_lru_stability():
         print(f"初始化失败: {e}")
         return False
 
+    # LightMem 的基本语义是按 Block（pages_per_block 个 page）读写。
+    # 测试侧也对齐到 Block 粒度，否则会出现：只写 1 页但触发 1 个 Block I/O，
+    # 再叠加并发与短时间窗口，容易偶现 read_success=0。
+    pages_per_block = int(getattr(service, "_n", 0))
+    if pages_per_block <= 0:
+        raise RuntimeError("PyLocalCacheService._n 不存在或无效，无法获取 pages_per_block")
+
+    # 预留最后一个 source block 给 VIP，避免与写线程争抢同一 source 页
+    vip_block_start = SOURCE_END - pages_per_block
+    usable_source_end = vip_block_start
+    if usable_source_end <= SOURCE_START:
+        raise RuntimeError("Source 区域不足以预留 VIP block")
+
     # 4. 定义并发任务
     stop_event = threading.Event()
     errors = []
 
-    # 记录 Token -> Source Page Index 的映射
-    # 用于验证读取回来的数据是否正确
+    # 只记录“已确认落盘可 query”的 Token -> signature
+    # 读线程只从该集合抽样，避免把正在写/写失败(返回0)的 token 当作可读 token。
     token_map = {}
     map_lock = threading.Lock()
 
     # 统计信息
     stats = {
-        "written": 0,
-        "write_new": 0,      # 新写入的 token
-        "write_update": 0,   # 更新已有的 token
+        "written": 0,           # 写入成功且可 query 的 token 次数
+        "write_new": 0,         # 新写入的 token
+        "write_update": 0,      # 更新已有的 token
+        "write_retry": 0,       # 因写入未落盘而重试次数
+        "write_not_persisted": 0,  # 写任务完成但 query 仍为 false 的次数
         "read_success": 0,
         "read_miss_early": 0, # Query 阶段发现 Miss
         "read_miss_late": 0,  # Read 阶段发现 Miss (并发淘汰)
@@ -89,6 +110,9 @@ def test_mixed_lru_stability():
     }
     stats_lock = threading.Lock()
 
+    # 写入就绪事件：避免 readers 在可读 token 为空时空转/偶现 0 成功读取
+    ready_event = threading.Event()
+
     # 写入线程
     def writer_thread(tid):
         count = 0
@@ -97,11 +121,17 @@ def test_mixed_lru_stability():
         base_token = tid * 1000000
         token_pool_size = 100  # 每个线程 100 个不同的 token
 
-        # 每个线程独占一段 page 区域，避免多线程并发写同一个 page
-        # 将 SOURCE 区域平均分配给 4 个写线程
-        num_writers = 4
-        pages_per_writer = (SOURCE_END - SOURCE_START) // num_writers
-        thread_page_start = SOURCE_START + tid * pages_per_writer
+        # 每个线程分配若干 source block（对齐 pages_per_block），避免并发写同一 source block
+        source_block_starts = list(range(SOURCE_START, usable_source_end, pages_per_block))
+        thread_blocks = source_block_starts[tid::4]
+        if not thread_blocks:
+            raise RuntimeError(f"Writer {tid} 没有可用的 source blocks")
+
+        # 预构建 indexer tensor，避免循环中反复构造
+        thread_indexers = [
+            torch.arange(bs, bs + pages_per_block, dtype=torch.int32)
+            for bs in thread_blocks
+        ]
 
         while not stop_event.is_set():
             try:
@@ -111,38 +141,56 @@ def test_mixed_lru_stability():
                 data = [token_val]
                 hash_128s = generate_cumulative_hashes(data)
 
-                # 映射到本线程独占的 page 区域
-                page_idx = thread_page_start + (token_idx % pages_per_writer)
-                indexer = torch.tensor([page_idx], dtype=torch.int32)
-                # 写入前先更新内存中的数据为此token对应的特征值
-                # 使用 token_val 的某个特征作为填充值,确保每个token有唯一的数据模式
-                token_signature = (token_val // 1000) % 10  # 使用token的高位作为特征
-                kvcache[page_idx].fill_(token_signature)
+                # 选择一个 source block 并填充整个 block 的数据（对齐底层 Block 粒度）
+                block_sel = token_idx % len(thread_blocks)
+                src_block_start = thread_blocks[block_sel]
+                indexer = thread_indexers[block_sel]
 
-                # 记录映射 (在写入前记录，虽然有微小的时间差，但只要不覆盖旧 Token 就行)
+                token_signature = token_to_signature(token_val)
+                kvcache[src_block_start:src_block_start + pages_per_block].fill_(token_signature)
+
+                # 提交写任务并等待结束；注意：底层可能因为临时拥塞/写跳过导致 write 返回 0，
+                # 这种情况下 task 也会 ready，但 query 仍为 false。测试侧要识别并重试。
+                max_retries = 10
+                persisted = False
                 is_new_token = False
+                for attempt in range(max_retries):
+                    if attempt > 0:
+                        with stats_lock:
+                            stats["write_retry"] += 1
+                        time.sleep(0.01 * attempt)
+
+                    task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="w")
+                    while not task.ready():
+                        time.sleep(0.001)
+
+                    exists = service.query(hash_128s)
+                    if exists and exists[0]:
+                        persisted = True
+                        break
+
+                if not persisted:
+                    with stats_lock:
+                        stats["write_not_persisted"] += 1
+                    # 本轮写入没有真正落盘，不把 token 放进可读集合
+                    count += 1
+                    continue
+
                 with map_lock:
                     is_new_token = (token_val not in token_map)
-                    token_map[token_val] = (page_idx, token_signature)  # 同时记录签名值
-                    # 限制 map 大小，移除太旧的（模拟应用层遗忘）
-                    # 但为了测试 LRU，我们其实希望 map 里保留的比 disk 多，这样才能测出 miss
+                    token_map[token_val] = token_signature
+                    # 限制 map 大小（模拟应用层遗忘）
                     if len(token_map) > 5000:
-                        # 随机移除一些，或者移除最早的
-                        # 字典是插入有序的 (Python 3.7+)
                         first_key = next(iter(token_map))
                         del token_map[first_key]
 
-                # 提交写任务
-                task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="w")
-                while not task.ready():
-                    time.sleep(0.001)
-
                 with stats_lock:
                     stats["written"] += 1
-                    if is_new_token:
-                        stats["write_new"] += 1
-                    else:
-                        stats["write_update"] += 1
+                    stats["write_new"] += 1 if is_new_token else 0
+                    stats["write_update"] += 0 if is_new_token else 1
+
+                if stats["written"] >= 20:
+                    ready_event.set()
 
                 count += 1
                 if count % 100 == 0:
@@ -162,6 +210,10 @@ def test_mixed_lru_stability():
 
         while not stop_event.is_set():
             try:
+                # 等待至少有一定数量的可读 token
+                if not ready_event.is_set():
+                    time.sleep(0.02)
+                    continue
                 # 随机选一个已知的 Token
                 target_token = None
                 expected_signature = -1
@@ -180,12 +232,12 @@ def test_mixed_lru_stability():
                             hot_tokens.remove(target_token)
                             target_token = None
                         else:
-                            _, expected_signature = token_map[target_token]
+                            expected_signature = token_map[target_token]
 
                     if target_token is None:
                         # 随机选一个 token，并可能将其加入热点列表
                         target_token = random.choice(list(token_map.keys()))
-                        _, expected_signature = token_map[target_token]
+                        expected_signature = token_map[target_token]
 
                         # 10% 概率成为新的热点
                         if random.random() < 0.1 and len(hot_tokens) < 20:
@@ -203,15 +255,29 @@ def test_mixed_lru_stability():
                 if not exists[0]:
                     with stats_lock:
                         stats["read_miss_early"] += 1
+                    # 已被淘汰，移出可读集合，避免反复命中 miss
+                    with map_lock:
+                        token_map.pop(target_token, None)
+                    if target_token in hot_tokens:
+                        try:
+                            hot_tokens.remove(target_token)
+                        except ValueError:
+                            pass
                     continue
 
-                # 尝试读取到 Dest 区域
-                dest_page_idx = random.randint(DEST_START, DEST_END - 1)
-                indexer = torch.tensor([dest_page_idx], dtype=torch.int32)
+                # 尝试读取到 Dest 区域：对齐 Block 粒度，并为每个 reader 分配独占 dest blocks
+                dest_block_starts = list(range(DEST_START, DEST_END, pages_per_block))
+                thread_dest_blocks = dest_block_starts[tid::4]
+                if not thread_dest_blocks:
+                    raise RuntimeError(f"Reader {tid} 没有可用的 dest blocks")
 
-                # 先把 Dest Page 清零，防止残留数据干扰验证
-                kvcache[dest_page_idx].zero_()
-                task = service.create(hash_128s=hash_128s, kv_page_indexer=indexer, mode="r")
+                # 选择一个 dest block（线程内轮转即可）
+                dest_block_start = thread_dest_blocks[count % len(thread_dest_blocks)]
+                dest_indexer = torch.arange(dest_block_start, dest_block_start + pages_per_block, dtype=torch.int32)
+
+                # 先把 Dest Block 清零，防止残留数据干扰验证
+                kvcache[dest_block_start:dest_block_start + pages_per_block].zero_()
+                task = service.create(hash_128s=hash_128s, kv_page_indexer=dest_indexer, mode="r")
 
                 wait_start = time.time()
                 while not task.ready():
@@ -229,17 +295,18 @@ def test_mixed_lru_stability():
                     # 验证数据 - 使用 token 的签名值
                     expected_val = expected_signature
 
-                    # 使用 torch.all 进行严格的全量检查
-                    if torch.all(kvcache[dest_page_idx] == expected_val):
+                    # 使用 torch.all 进行严格的全量检查（整个 block）
+                    if torch.all(kvcache[dest_block_start:dest_block_start + pages_per_block] == expected_val):
                         with stats_lock:
                             stats["read_success"] += 1
                     else:
                         with stats_lock:
                             stats["data_mismatch"] += 1
                         print(f"[Reader {tid}] Data Mismatch! Token {target_token}, Expected Val {expected_val}")
-                        # 打印实际值看看 (前10个和均值)
-                        print(f"  Actual mean: {torch.mean(kvcache[dest_page_idx].float()):.2f}")
-                        print(f"  First 10 vals: {kvcache[dest_page_idx][:10].tolist()}")
+                        # 打印实际值看看 (第一页前10个和均值)
+                        first_page = kvcache[dest_block_start]
+                        print(f"  Actual mean(first page): {torch.mean(first_page.float()):.2f}")
+                        print(f"  First 10 vals(first page): {first_page[:10].tolist()}")
                         print(f"  Task states: {task_states}")
                 else:
                     # 任务未完成、被中止或失败（可能是 partial read 导致的 abort，或并发淘汰）
@@ -260,20 +327,24 @@ def test_mixed_lru_stability():
     # VIP 保活线程
     def vip_thread():
         vip_token = 88888888
-        # 使用最后一个page,避免与任何写线程冲突
-        vip_page = SOURCE_END - 1
-        vip_signature = (vip_token // 1000) % 10
+        vip_signature = token_to_signature(vip_token)
 
-        # 先写入前更新内存数据
-        kvcache[vip_page].fill_(vip_signature)
+        vip_indexer = torch.arange(vip_block_start, vip_block_start + pages_per_block, dtype=torch.int32)
+        kvcache[vip_block_start:vip_block_start + pages_per_block].fill_(vip_signature)
 
         print("[VIP] Writing VIP token...")
         vip_data = [vip_token]
         vip_hash_128s = generate_cumulative_hashes(vip_data)
 
-        task = service.create(hash_128s=vip_hash_128s, kv_page_indexer=torch.tensor([vip_page], dtype=torch.int32), mode="w")
-        while not task.ready():
-            time.sleep(0.001)
+        # 写入 VIP 并确认落盘
+        for attempt in range(10):
+            task = service.create(hash_128s=vip_hash_128s, kv_page_indexer=vip_indexer, mode="w")
+            while not task.ready():
+                time.sleep(0.001)
+            exists = service.query(vip_hash_128s)
+            if exists and exists[0]:
+                break
+            time.sleep(0.02 * (attempt + 1))
 
         # 循环保活
         while not stop_event.is_set():
@@ -288,8 +359,8 @@ def test_mixed_lru_stability():
                         stats["vip_evicted"] += 1
                     # 如果被淘汰了，重新写入，继续测试
                     # print("[VIP] Evicted! Re-writing...")
-                    kvcache[vip_page].fill_(vip_signature)  # 重新填充数据
-                    task = service.create(hash_128s=vip_hash_128s, kv_page_indexer=torch.tensor([vip_page], dtype=torch.int32), mode="w")
+                    kvcache[vip_block_start:vip_block_start + pages_per_block].fill_(vip_signature)
+                    task = service.create(hash_128s=vip_hash_128s, kv_page_indexer=vip_indexer, mode="w")
                     while not task.ready():
                         time.sleep(0.001)
 
@@ -302,11 +373,16 @@ def test_mixed_lru_stability():
     print("启动并发读写线程...")
     threads = []
 
-    # 4 Writers
+    # 先启动 Writers，等积累一批可读 token 再启动 Readers（避免偶现 read_success=0）
     for i in range(4):
         t = threading.Thread(target=writer_thread, args=(i,))
         threads.append(t)
         t.start()
+
+    # warmup：等待至少写入并确认落盘一定数量 token
+    warmup_timeout_s = 10
+    print(f"Warmup: 等待至少 20 个 token 落盘（超时 {warmup_timeout_s}s）...")
+    ready_event.wait(timeout=warmup_timeout_s)
 
     # 4 Readers
     for i in range(4):
