@@ -74,6 +74,7 @@ public:
   // Observability: number of in-flight operations targeting a shard.
   uint32_t shardInflight(size_t shard_id) const;
   uint64_t shardWrittenBytes(size_t shard_id) const;
+  uint64_t writtenBytes() const;
 
   // True LRU eviction observability (local disk cache). These counts are local to this node.
   // `shardEvictionCount`: evictions for a single shard.

@@ -205,7 +205,7 @@ protected:
         return;
       }
 
-      const uint64_t total = total_written_bytes_.load(std::memory_order_relaxed);
+      const uint64_t total = storage_->writtenBytes();
       if (total == 0) {
         return;
       }
@@ -451,7 +451,7 @@ private:
     const size_t written = storage_->write(cpu_buffer, block->hash, data_crc, logical_bytes);
 
     // Handle different write results:
-    // - written > 0: Success (len_bytes for offline, block_size_ for online)
+    // - written > 0: Success.
     // - written == 0: Skipped (already exists, failed, or temporary congestion)
     if (written != 0 && written != static_cast<size_t>(logical_bytes) && written != block_size_) {
       fprintf(stderr,
@@ -461,7 +461,7 @@ private:
     }
 
     // If written == 0:
-    // - Offline mode: treat as failure (avoid silent data loss).
+    // - Offline mode: treat as failure; local duplicates return block_size_ from storage.
     // - Online mode: tolerate short transient ownership migration windows with retries.
     size_t final_written = written;
     if (final_written == 0) {
@@ -507,10 +507,6 @@ private:
         return false;
       }
     }
-    if (final_written > 0) {
-      total_written_bytes_.fetch_add(static_cast<uint64_t>(final_written), std::memory_order_relaxed);
-    }
-
     // Record end time after write completes
     const auto now_duration = std::chrono::steady_clock::now().time_since_epoch();
     const int64_t now_ticks = static_cast<int64_t>(now_duration.count());
