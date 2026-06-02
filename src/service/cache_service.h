@@ -121,12 +121,14 @@ public:
     }
     block_size_ = page_bytes * pages_per_block;
 
+    const double bytes_per_gb = 1024.0 * 1024.0 * 1024.0;
+
     std::fprintf(stderr, "[light_mem] CacheService created with following cache info:\n");
     std::fprintf(stderr, "\tNum of page: %lld\n", static_cast<long long>(cache_info_.num_of_page));
-    std::fprintf(stderr, "\tPage Size: %lld\n", static_cast<long long>(cache_info_.page_size));
-    std::fprintf(stderr, "\tPage Stride: %lld\n", static_cast<long long>(cache_info_.page_stride));
+    std::fprintf(stderr, "\tPage Size: %.2f GB\n", static_cast<double>(cache_info_.page_size) / bytes_per_gb);
+    std::fprintf(stderr, "\tPage Stride: %.2f GB\n", static_cast<double>(cache_info_.page_stride) / bytes_per_gb);
     std::fprintf(stderr, "\tPages Per Block: %lld\n", static_cast<long long>(pages_per_block));
-    std::fprintf(stderr, "\tBlock Size: %lld\n", static_cast<long long>(block_size_));
+    std::fprintf(stderr, "\tBlock Size: %.2f GB\n", static_cast<double>(block_size_) / bytes_per_gb);
     std::fflush(stderr);
   }
 

@@ -2,6 +2,8 @@
 
 #include "config.h"
 
+#include "utils/fsync_compat.h"
+
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -11,7 +13,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <filesystem>
+#include <functional>
+#include <mutex>
 #include <stdexcept>
 
 namespace cache {
@@ -143,9 +150,13 @@ static void write_init_marker(const std::string &path) {
 
 void LocalStorageEngine::cleanup() {
   for (size_t i = 0; i < shard_; i++) {
-    if (file_fds_[i] >= 0) {
-      ::close(file_fds_[i]);
-      file_fds_[i] = -1;
+    if (i < file_fds_.size()) {
+      for (int &fd : file_fds_[i]) {
+        if (fd >= 0) {
+          ::close(fd);
+          fd = -1;
+        }
+      }
     }
     if (meta_fds_[i] >= 0) {
       ::close(meta_fds_[i]);
@@ -204,9 +215,25 @@ void LocalStorageEngine::createOrOpenFiles(size_t shard_storage_size) {
     const std::string data_filename = shard_path + "/data";
     const std::string meta_filename = shard_path + "/meta";
 
+    // Scheme A: each shard's data is split across num_stripes_ stripe sub-files.
+    // Stripe j holds one block segment of stripe_size_ bytes per slot, so the per-stripe
+    // file is sized shard_storage_size / num_stripes_. With num_stripes_ == 1, the single
+    // stripe file is named "data" (backward compatible); otherwise "data.0 .. data.S-1".
+    const size_t stripe_file_size = shard_storage_size / num_stripes_;
+    file_fds_[i].assign(num_stripes_, -1);
+    for (size_t j = 0; j < num_stripes_; ++j) {
+      const std::string stripe_path =
+          (num_stripes_ == 1) ? data_filename : (data_filename + "." + std::to_string(j));
+      if (initializer) {
+        // Open data stripe (preallocate only when newly created).
+        file_fds_[i][j] = open_existing_or_create_new(stripe_path, stripe_file_size, nullptr, 0);
+      } else {
+        // Follower: never create/truncate.
+        file_fds_[i][j] = open_existing_file(stripe_path);
+      }
+    }
+
     if (initializer) {
-      // Open data file (preallocate only when newly created).
-      file_fds_[i] = open_existing_or_create_new(data_filename, shard_storage_size, nullptr, 0);
       // Online mode only: the metadata journal (WAL) backs cross-node recovery.
       // Offline mode skips it entirely to prioritize read/write performance.
       if (online_mode_) {
@@ -214,7 +241,6 @@ void LocalStorageEngine::createOrOpenFiles(size_t shard_storage_size) {
       }
     } else {
       // Follower: never create/truncate.
-      file_fds_[i] = open_existing_file(data_filename);
       if (online_mode_) {
         meta_fds_[i] = open_existing_file(meta_filename);
       }
@@ -350,6 +376,131 @@ bool LocalStorageEngine::pwriteAll(int fd, const void *buf, size_t len, off_t of
     offset += static_cast<off_t>(n);
   }
   return true;
+}
+
+// Scheme A: split [0, len_bytes) of a block into up to num_stripes_ segments and issue them
+// concurrently across the stripe files via io_pool_. Segment j (j*stripe_size_ .. ) maps to
+// file_fds_[shard][j] at byte offset slot_id * stripe_size_. Segments target distinct files,
+// so concurrent pread/pwrite are independent. The caller services segment 0 inline and waits
+// for the rest on a local latch; the per-shard io lock held by the caller is unchanged.
+namespace {
+struct StripeIoLatch {
+  std::mutex mu;
+  std::condition_variable cv;
+  size_t remaining = 0;
+  std::atomic<bool> ok{true};
+
+  void completeOne() {
+    std::lock_guard<std::mutex> lk(mu);
+    if (--remaining == 0) {
+      cv.notify_one();
+    }
+  }
+
+  void wait() {
+    std::unique_lock<std::mutex> lk(mu);
+    cv.wait(lk, [this] { return remaining == 0; });
+  }
+};
+} // namespace
+
+bool LocalStorageEngine::writeDataBlock(size_t shard_id, size_t slot_id, const char *buf, size_t len_bytes) {
+  const std::vector<int> &fds = file_fds_[shard_id];
+  const off_t base = static_cast<off_t>(slot_id) * static_cast<off_t>(stripe_size_);
+
+  if (num_stripes_ <= 1 || !io_pool_ || len_bytes <= stripe_size_) {
+    // Single stripe touched (small/partial write or striping disabled): one syscall.
+    return pwriteAll(fds[0], buf, len_bytes, base);
+  }
+
+  // Number of stripes that actually carry data for this logical length.
+  const size_t active = std::min(num_stripes_, (len_bytes + stripe_size_ - 1) / stripe_size_);
+
+  StripeIoLatch latch;
+  latch.remaining = active - 1; // segment 0 serviced inline below.
+
+  for (size_t j = 1; j < active; ++j) {
+    const size_t soff = j * stripe_size_;
+    const size_t clen = std::min(stripe_size_, len_bytes - soff);
+    const int fd = fds[j];
+    io_pool_->submit([this, fd, buf, soff, clen, base, &latch]() {
+      if (!pwriteAll(fd, buf + soff, clen, base)) {
+        latch.ok.store(false, std::memory_order_relaxed);
+      }
+      latch.completeOne();
+    });
+  }
+
+  // Segment 0 inline on the caller thread.
+  if (!pwriteAll(fds[0], buf, std::min(stripe_size_, len_bytes), base)) {
+    latch.ok.store(false, std::memory_order_relaxed);
+  }
+
+  latch.wait();
+  return latch.ok.load(std::memory_order_relaxed);
+}
+
+bool LocalStorageEngine::readDataBlock(size_t shard_id, size_t slot_id, char *buf, size_t len_bytes) {
+  const std::vector<int> &fds = file_fds_[shard_id];
+  const off_t base = static_cast<off_t>(slot_id) * static_cast<off_t>(stripe_size_);
+
+  if (num_stripes_ <= 1 || !io_pool_ || len_bytes <= stripe_size_) {
+    return preadAll(fds[0], buf, len_bytes, base);
+  }
+
+  const size_t active = std::min(num_stripes_, (len_bytes + stripe_size_ - 1) / stripe_size_);
+
+  StripeIoLatch latch;
+  latch.remaining = active - 1;
+
+  for (size_t j = 1; j < active; ++j) {
+    const size_t soff = j * stripe_size_;
+    const size_t clen = std::min(stripe_size_, len_bytes - soff);
+    const int fd = fds[j];
+    io_pool_->submit([this, fd, buf, soff, clen, base, &latch]() {
+      if (!preadAll(fd, buf + soff, clen, base)) {
+        latch.ok.store(false, std::memory_order_relaxed);
+      }
+      latch.completeOne();
+    });
+  }
+
+  if (!preadAll(fds[0], buf, std::min(stripe_size_, len_bytes), base)) {
+    latch.ok.store(false, std::memory_order_relaxed);
+  }
+
+  latch.wait();
+  return latch.ok.load(std::memory_order_relaxed);
+}
+
+bool LocalStorageEngine::syncDataBlock(size_t shard_id) {
+  // Online durability: a block write touches all stripes (full block_size_), so fdatasync each.
+  for (int fd : file_fds_[shard_id]) {
+    if (fd >= 0 && cache::utils::fdatasync_compat(fd) != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void LocalStorageEngine::fadviseDataDontNeed(size_t shard_id, size_t slot_id, size_t len_bytes) {
+#ifndef __APPLE__
+  const off_t base = static_cast<off_t>(slot_id) * static_cast<off_t>(stripe_size_);
+  const std::vector<int> &fds = file_fds_[shard_id];
+  const size_t active =
+      (num_stripes_ <= 1) ? 1 : std::min(num_stripes_, (len_bytes + stripe_size_ - 1) / stripe_size_);
+  for (size_t j = 0; j < active; ++j) {
+    const size_t soff = j * stripe_size_;
+    const size_t clen = (len_bytes > soff) ? std::min(stripe_size_, len_bytes - soff) : 0;
+    if (clen > 0 && fds[j] >= 0) {
+      (void)posix_fadvise(fds[j], base, static_cast<off_t>(clen), POSIX_FADV_DONTNEED);
+    }
+  }
+#else
+  (void)shard_id;
+  (void)slot_id;
+  (void)len_bytes;
+#endif
 }
 
 bool LocalStorageEngine::readSuperBlockAt(size_t shard_id, off_t off, SuperBlock &sb) {

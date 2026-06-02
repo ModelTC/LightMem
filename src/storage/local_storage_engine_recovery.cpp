@@ -117,9 +117,8 @@ void LocalStorageEngine::recoverShardToRedis(size_t shard_id) {
       }
     }
     if (!crc_ok) {
-      const size_t offset_bytes = slot_id * block_size_;
-      if (file_fds_[shard_id] >= 0 &&
-          preadAll(file_fds_[shard_id], buf.data(), block_size_, static_cast<off_t>(offset_bytes))) {
+      if (!file_fds_[shard_id].empty() &&
+          readDataBlock(shard_id, slot_id, reinterpret_cast<char *>(buf.data()), block_size_)) {
         crc = compute_crc32(buf.data(), block_size_);
         crc_ok = true;
       }

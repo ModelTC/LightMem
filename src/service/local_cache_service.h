@@ -199,45 +199,42 @@ protected:
     }
 
     if (task->operation_mode == cache::task::Mode::Write) {
-      // Try to acquire the lock, skip logging if contention occurs
-      std::unique_lock<std::mutex> guard(log_mutex_, std::try_to_lock);
-      if (!guard.owns_lock()) {
+      window_write_block_count_.fetch_add(static_cast<uint64_t>(task->blocks.size()), std::memory_order_relaxed);
+      write_finalize_in_progress_.fetch_add(1, std::memory_order_relaxed);
+
+      const bool queue_drained = (active_write_creates_.load(std::memory_order_relaxed) == 0);
+      const uint64_t remaining_finalize_hooks =
+          write_finalize_in_progress_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+      if (!queue_drained || remaining_finalize_hooks != 0) {
+        return;
+      }
+
+      std::lock_guard<std::mutex> guard(log_mutex_);
+      if (active_write_creates_.load(std::memory_order_relaxed) != 0 ||
+          write_finalize_in_progress_.load(std::memory_order_relaxed) != 0) {
         return;
       }
 
       const uint64_t total = storage_->writtenBytes();
-      if (total == 0) {
-        return;
-      }
-
-      const auto now = std::chrono::steady_clock::now();
-      if (last_log_time_ != std::chrono::steady_clock::time_point{}) {
-        const double elapsed_sec =
-            std::chrono::duration_cast<std::chrono::duration<double>>(now - last_log_time_).count();
-        if (elapsed_sec < 3.0) {
-          return;
-        }
-      }
-
       const uint64_t previous_bytes = last_logged_bytes_;
-      const uint64_t delta_bytes = (total >= previous_bytes) ? (total - previous_bytes) : 0;
+      const uint64_t current_bytes = (total >= previous_bytes) ? (total - previous_bytes) : 0;
+      const uint64_t current_write_block_num = window_write_block_count_.exchange(0, std::memory_order_relaxed);
       double speed_gbps = 0.0;
 
-      // IMPORTANT: use wall-clock delta between log prints.
-      // Summing per-task (create()->ready()) durations double-counts time under concurrency,
-      // which makes the reported speed much smaller than the actual byte growth.
-      if (last_log_time_ != std::chrono::steady_clock::time_point{}) {
-        const double elapsed_sec =
-            std::chrono::duration_cast<std::chrono::duration<double>>(now - last_log_time_).count();
+      const int64_t first_ticks = first_write_time_ticks_.exchange(0, std::memory_order_relaxed);
+      const int64_t last_ticks = last_write_time_ticks_.exchange(0, std::memory_order_relaxed);
+      if (first_ticks != 0 && last_ticks > first_ticks) {
+        const double elapsed_sec = static_cast<double>(last_ticks - first_ticks) /
+                                   static_cast<double>(std::chrono::steady_clock::duration::period::den);
         if (elapsed_sec > 0.0) {
-          speed_gbps = (static_cast<double>(delta_bytes) / (1024.0 * 1024.0 * 1024.0)) / elapsed_sec;
+          speed_gbps = (static_cast<double>(current_bytes) / (1024.0 * 1024.0 * 1024.0)) / elapsed_sec;
         }
       }
 
-      last_log_time_ = now;
       last_logged_bytes_ = total;
 
       const double total_gb = static_cast<double>(total) / (1024.0 * 1024.0 * 1024.0);
+      const double current_gb = static_cast<double>(current_bytes) / (1024.0 * 1024.0 * 1024.0);
 
       const size_t owned_shards = storage_->ownedShardCount();
       const uint64_t effective_bytes = storage_->effectiveWritableCapacityBytes();
@@ -245,9 +242,11 @@ protected:
       const bool evict = storage_->evictionObserved();
 
       std::fprintf(stderr,
-                   "[light_mem] cumulative disk write size: %.2f GB, recent write speed: %.2f GB/s, owned_shards: %zu, "
+                   "[light_mem] cumulative disk write size: %.2f GB, current disk write size: %.2f GB, "
+                   "recent write speed: %.2f GB/s, owned_shards: %zu, "
                    "effective_write_capacity: %.2f GB, evict: %s\n",
-                   total_gb, speed_gbps, owned_shards, effective_gb, evict ? "True" : "False");
+                   total_gb, current_gb, speed_gbps, owned_shards, effective_gb,
+                   evict ? "True" : "False");
       std::fflush(stderr);
       return;
     }
@@ -388,7 +387,13 @@ private:
     }
 
     const uint32_t logical_bytes = static_cast<uint32_t>(num_of_page * this->cache_info_.page_size);
-    const size_t read_bytes = storage_->read(cpu_buffer, block->hash, logical_bytes);
+
+    // Zero-copy fast path: when the destination pages are contiguous in the kvcache tensor,
+    // read straight into the tensor and skip both the bounce buffer and the cpu_scatter memcpy.
+    char *const direct_dst = contiguousDstPtr(this->cache_info_, page_ptr, num_of_page);
+    char *const read_dst = direct_dst ? direct_dst : cpu_buffer;
+
+    const size_t read_bytes = storage_->read(read_dst, block->hash, logical_bytes);
     if (read_bytes != static_cast<size_t>(logical_bytes)) {
       // Only log if it's a real I/O error (partial read), not cache miss (read_bytes == 0)
       if (read_bytes != 0) {
@@ -401,7 +406,10 @@ private:
 
     total_read_bytes_.fetch_add(static_cast<uint64_t>(read_bytes), std::memory_order_relaxed);
 
-    cpu_scatter(this->cache_info_, cpu_buffer, page_ptr, num_of_page);
+    if (!direct_dst) {
+      // Slow path (non-contiguous destination pages): scatter from the bounce buffer.
+      cpu_scatter(this->cache_info_, cpu_buffer, page_ptr, num_of_page);
+    }
 
     // Record end time after scatter completes
     const auto now_duration = std::chrono::steady_clock::now().time_since_epoch();
@@ -513,6 +521,34 @@ private:
     last_write_time_ticks_.store(now_ticks, std::memory_order_relaxed);
 
     return true;  // Success or acceptable skip
+  }
+
+  /**
+   * @brief Return the contiguous destination pointer in the kvcache tensor, or nullptr.
+   *
+   * If the destination pages occupy a contiguous, in-range span of the kvcache tensor
+   * (page_stride == page_size and indices form an ascending run), a disk read can land
+   * directly into the tensor, avoiding the bounce buffer + scatter memcpy entirely.
+   * Returns nullptr when the fast path does not apply (caller must use the slow path).
+   */
+  static char *contiguousDstPtr(const CacheParam_t &info, const int32_t *page_idx, int64_t num_of_page) {
+    if (num_of_page <= 0 || info.page_stride != info.page_size) {
+      return nullptr;
+    }
+    const int32_t first = page_idx[0];
+    if (first < 0 || first >= info.num_of_page) {
+      return nullptr;
+    }
+    for (int64_t local_page = 1; local_page < num_of_page; ++local_page) {
+      if (page_idx[local_page] != first + static_cast<int32_t>(local_page)) {
+        return nullptr;
+      }
+    }
+    const int64_t last = static_cast<int64_t>(first) + num_of_page - 1;
+    if (last >= info.num_of_page) {
+      return nullptr;
+    }
+    return info.base_ptr + static_cast<int64_t>(first) * info.page_stride;
   }
 
   /**
@@ -696,6 +732,8 @@ private:
   bool online_mode_{false};
 
   std::atomic<uint64_t> total_written_bytes_{0};
+  std::atomic<uint64_t> window_write_block_count_{0};
+  std::atomic<uint64_t> write_finalize_in_progress_{0};
   std::atomic<uint64_t> window_logical_written_bytes_{0};
   std::atomic<int64_t> window_logical_write_time_ticks_{0};
   std::atomic<int64_t> first_write_time_ticks_{0};
