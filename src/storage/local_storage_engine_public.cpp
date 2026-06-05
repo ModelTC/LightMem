@@ -160,10 +160,11 @@ LocalStorageEngine::LocalStorageEngine(const std::string &filename, const size_t
       }
     }
     createOrOpenFiles(shard_storage_size);
-    if (!online_mode_) {
-      recoverAllShards(shard_capacity);
+    // Offline mode keeps only the in-memory index + data file: no recovery scan and
+    // no background journal workers, matching pre-multi-node single-node performance.
+    if (online_mode_) {
+      startJournalWorkers();
     }
-    startJournalWorkers();
   } catch (...) {
     cleanup();
     throw;
@@ -348,22 +349,10 @@ size_t LocalStorageEngine::write(const char *buf, const std::string &hash, uint3
     // Mark ready immediately after the data write completes.
     caches_[shard_id]->mark_ready(hash, 0);
 
-    // Offline mode: also enqueue journal metadata asynchronously so restart recovery
-    // can rebuild from snapshot + WAL without blocking the write hot path.
-    auto task = std::make_shared<JournalTask>();
-    task->shard_id = shard_id;
-    task->epoch = 0;
-    task->write_offset = static_cast<uint64_t>(offset_bytes);
-    task->write_len = len_bytes;
-    task->data_crc = 0;
-    task->slot_id = slot_id;
-    task->hash = hash;
-    task->evicted_hash = evicted_hash;
-    {
-      std::lock_guard<std::mutex> lk(*journal_mu_[shard_id]);
-      journal_queue_[shard_id].push_back(task);
-    }
-    journal_cv_[shard_id]->notify_one();
+    // Offline mode prioritizes raw read/write throughput: no metadata journal,
+    // no WAL, and no cross-restart recoverability. The on-disk data file is the
+    // only persisted state, matching the pre-multi-node single-node behavior.
+    (void)evicted_hash;
 
 #ifndef __APPLE__
     // Linux regression fix: keep offline write path aligned with historical behavior.
@@ -555,15 +544,13 @@ size_t LocalStorageEngine::read(char *buf, const std::string &hash, uint32_t len
     return 0;
   }
 
-  // Offline mode: local lookup only.
+  // Offline mode: local lookup only. Single index lookup under the shard read lock,
+  // matching the pre-multi-node single-node hot path (no re-validation overhead).
   if (!online_mode_) {
     const size_t shard_id = getShard(hash);
+    std::shared_lock<std::shared_mutex> lock(*io_locks_[shard_id]);
     const size_t slot_id = caches_[shard_id]->get_offset(hash);
     if (slot_id == static_cast<size_t>(-1)) {
-      return 0;
-    }
-    std::shared_lock<std::shared_mutex> lock(*io_locks_[shard_id]);
-    if (caches_[shard_id]->get_offset(hash) != slot_id) {
       return 0;
     }
     const size_t offset_bytes = slot_id * block_size_;

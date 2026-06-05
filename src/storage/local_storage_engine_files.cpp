@@ -207,12 +207,17 @@ void LocalStorageEngine::createOrOpenFiles(size_t shard_storage_size) {
     if (initializer) {
       // Open data file (preallocate only when newly created).
       file_fds_[i] = open_existing_or_create_new(data_filename, shard_storage_size, nullptr, 0);
-      // Open meta file (initialize header only when newly created).
-      meta_fds_[i] = open_existing_or_create_new(meta_filename, 0, kMetaHeader, META_HEADER_SIZE);
+      // Online mode only: the metadata journal (WAL) backs cross-node recovery.
+      // Offline mode skips it entirely to prioritize read/write performance.
+      if (online_mode_) {
+        meta_fds_[i] = open_existing_or_create_new(meta_filename, 0, kMetaHeader, META_HEADER_SIZE);
+      }
     } else {
       // Follower: never create/truncate.
       file_fds_[i] = open_existing_file(data_filename);
-      meta_fds_[i] = open_existing_file(meta_filename);
+      if (online_mode_) {
+        meta_fds_[i] = open_existing_file(meta_filename);
+      }
     }
 
 #ifdef __APPLE__
@@ -223,7 +228,10 @@ void LocalStorageEngine::createOrOpenFiles(size_t shard_storage_size) {
     }
 #endif
 
-    ensureSuperBlocksInitialized(i);
+    // Superblocks are part of the WAL/recovery machinery; only needed online.
+    if (online_mode_) {
+      ensureSuperBlocksInitialized(i);
+    }
   }
 
   if (initializer) {
