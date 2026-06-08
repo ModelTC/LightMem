@@ -122,7 +122,6 @@ public:
     block_size_ = page_bytes * pages_per_block;
 
     const double bytes_per_gb = 1024.0 * 1024.0 * 1024.0;
-
     std::fprintf(stderr, "[light_mem] CacheService created with following cache info:\n");
     std::fprintf(stderr, "\tNum of page: %lld\n", static_cast<long long>(cache_info_.num_of_page));
     std::fprintf(stderr, "\tPage Size: %.2f GB\n", static_cast<double>(cache_info_.page_size) / bytes_per_gb);
@@ -284,6 +283,10 @@ public:
     std::lock_guard<std::mutex> lock(task->state_mutex);
     if (block->state == cache::task::State::Initial || block->state == cache::task::State::Working) {
       block->state = cache::task::State::Aborted;
+      if (task->operation_mode == cache::task::Mode::Write && !block->write_data_ready) {
+        block->write_data_ready = true;
+        task->num_data_ready_blocks.fetch_add(1, std::memory_order_release);
+      }
       task->num_finished_blocks.fetch_add(1, std::memory_order_release);
       if (task->ready()) {
         finalize_task(task);

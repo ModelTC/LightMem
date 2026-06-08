@@ -331,7 +331,19 @@ private:
           }
           char *cpu_buffer =
               (task->operation_mode == Mode::Read) ? r_cpu_buffers_[index].get() : w_cpu_buffers_[index].get();
-          processTask(block, cpu_buffer);
+          try {
+            processTask(block, cpu_buffer);
+          } catch (const std::exception &e) {
+            fprintf(stderr,
+                    "[light_mem error] worker %d: exception while processing block (hash=%s): %s; aborting block\n",
+                    index, block->hash.c_str(), e.what());
+            this->abort(block);
+          } catch (...) {
+            fprintf(stderr,
+                    "[light_mem error] worker %d: unknown exception while processing block (hash=%s); aborting block\n",
+                    index, block->hash.c_str());
+            this->abort(block);
+          }
         }
       }
     }
@@ -451,8 +463,16 @@ private:
     }
 
     // Critical optimization: Mark data as ready immediately after gather completes
-    // This allows Python layer to release pages without waiting for disk I/O
-    task->num_data_ready_blocks.fetch_add(1, std::memory_order_release);
+    // This allows Python layer to release pages without waiting for disk I/O.
+    // Guard with state_mutex + per-block flag so that this increment and a possible
+    // abort() of the same block are mutually exclusive and never double-count.
+    {
+      std::lock_guard<std::mutex> lock(task->state_mutex);
+      if (!block->write_data_ready) {
+        block->write_data_ready = true;
+        task->num_data_ready_blocks.fetch_add(1, std::memory_order_release);
+      }
+    }
 
     // Step 2: Write to disk (this happens asynchronously and doesn't block page release)
     // Always use the length-aware write path to skip redundant CRC recomputation.
