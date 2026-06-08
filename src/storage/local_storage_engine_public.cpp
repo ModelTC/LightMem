@@ -97,6 +97,40 @@ LocalStorageEngine::LocalStorageEngine(const std::string &filename, const size_t
                                        const std::string &index_prefix)
     : filename_(filename), storage_size_(storage_size), shard_(shard), block_size_(block_size),
       online_mode_(!index_endpoint.empty()) {
+  // Scheme A: configure data striping. A block is split across num_stripes_ stripe files so a
+  // single (large) block fans out to multiple files, which is the unit of write parallelism on afs.
+  {
+    auto read_env_ll = [](const char *name, int64_t fallback) -> int64_t {
+      const char *v = std::getenv(name);
+      if (v == nullptr || *v == '\0') {
+        return fallback;
+      }
+      char *end = nullptr;
+      const long long parsed = std::strtoll(v, &end, 10);
+      if (end == v || parsed <= 0) {
+        return fallback;
+      }
+      return static_cast<int64_t>(parsed);
+    };
+    int64_t stripes = read_env_ll(LM_DataStripesEnvVar, LM_DefaultDataStripes);
+    if (stripes < 1) {
+      stripes = 1;
+    }
+    // Stripes must evenly divide block_size_ so segments tile perfectly; reduce to the
+    // largest divisor <= requested count.
+    size_t s = static_cast<size_t>(stripes);
+    while (s > 1 && (block_size_ % s) != 0) {
+      --s;
+    }
+    num_stripes_ = (s == 0) ? 1 : s;
+    stripe_size_ = block_size_ / num_stripes_;
+
+    if (num_stripes_ > 1) {
+      const int64_t pool_threads = read_env_ll(LM_IoPoolThreadsEnvVar, LM_DefaultIoPoolThreads);
+      io_pool_ = std::make_unique<IoThreadPool>(static_cast<size_t>(pool_threads));
+    }
+  }
+
   // 每个 shard 分到的文件大小
   const size_t shard_storage_size = storage_size_ / shard_;
   // 每个 shard 能存储的块数
@@ -104,7 +138,7 @@ LocalStorageEngine::LocalStorageEngine(const std::string &filename, const size_t
 
   caches_.resize(shard_);
   io_locks_.resize(shard_);
-  file_fds_.resize(shard_, -1);
+  file_fds_.resize(shard_);
   meta_fds_.resize(shard_, -1);
   journal_entries_.assign(shard_, 0);
   superblock_seq_.assign(shard_, 0);
@@ -160,10 +194,11 @@ LocalStorageEngine::LocalStorageEngine(const std::string &filename, const size_t
       }
     }
     createOrOpenFiles(shard_storage_size);
-    if (!online_mode_) {
-      recoverAllShards(shard_capacity);
+    // Offline mode keeps only the in-memory index + data file: no recovery scan and
+    // no background journal workers, matching pre-multi-node single-node performance.
+    if (online_mode_) {
+      startJournalWorkers();
     }
-    startJournalWorkers();
   } catch (...) {
     cleanup();
     throw;
@@ -335,7 +370,8 @@ size_t LocalStorageEngine::write(const char *buf, const std::string &hash, uint3
       std::unique_lock<std::shared_mutex> lock(*io_locks_[shard_id]);
       // Offline hot-path: only write the valid logical bytes, not the full block.
       // For a 1-page write this reduces I/O from ~64 MB to ~1 MB.
-      if (!pwriteAll(file_fds_[shard_id], buf, static_cast<size_t>(len_bytes), static_cast<off_t>(offset_bytes))) {
+      // Scheme A: the block is striped across multiple files and written in parallel.
+      if (!writeDataBlock(shard_id, slot_id, buf, static_cast<size_t>(len_bytes))) {
         throw std::runtime_error("pwrite failed, errno=" + std::to_string(errno));
       }
     } catch (const std::exception &e) {
@@ -348,28 +384,15 @@ size_t LocalStorageEngine::write(const char *buf, const std::string &hash, uint3
     // Mark ready immediately after the data write completes.
     caches_[shard_id]->mark_ready(hash, 0);
 
-    // Offline mode: also enqueue journal metadata asynchronously so restart recovery
-    // can rebuild from snapshot + WAL without blocking the write hot path.
-    auto task = std::make_shared<JournalTask>();
-    task->shard_id = shard_id;
-    task->epoch = 0;
-    task->write_offset = static_cast<uint64_t>(offset_bytes);
-    task->write_len = len_bytes;
-    task->data_crc = 0;
-    task->slot_id = slot_id;
-    task->hash = hash;
-    task->evicted_hash = evicted_hash;
-    {
-      std::lock_guard<std::mutex> lk(*journal_mu_[shard_id]);
-      journal_queue_[shard_id].push_back(task);
-    }
-    journal_cv_[shard_id]->notify_one();
+    // Offline mode prioritizes raw read/write throughput: no metadata journal,
+    // no WAL, and no cross-restart recoverability. The on-disk data file is the
+    // only persisted state, matching the pre-multi-node single-node behavior.
+    (void)evicted_hash;
 
 #ifndef __APPLE__
     // Linux regression fix: keep offline write path aligned with historical behavior.
     // Drop newly written data pages from page cache to avoid polluting subsequent read cache.
-    (void)posix_fadvise(file_fds_[shard_id], static_cast<off_t>(offset_bytes), static_cast<off_t>(len_bytes),
-                        POSIX_FADV_DONTNEED);
+    fadviseDataDontNeed(shard_id, slot_id, static_cast<size_t>(len_bytes));
 #endif
 
     shard_written_bytes_[shard_id].fetch_add(static_cast<uint64_t>(block_size_), std::memory_order_relaxed);
@@ -500,10 +523,11 @@ size_t LocalStorageEngine::write(const char *buf, const std::string &hash, uint3
   const size_t offset_bytes = slot_id * block_size_;
   try {
     std::unique_lock<std::shared_mutex> lock(*io_locks_[shard_id]);
-    if (!pwriteAll(file_fds_[shard_id], buf, write_bytes, static_cast<off_t>(offset_bytes))) {
+    // Scheme A: stripe the full block across multiple files, then fdatasync every stripe.
+    if (!writeDataBlock(shard_id, slot_id, buf, write_bytes)) {
       throw std::runtime_error("pwrite failed, errno=" + std::to_string(errno));
     }
-    if (cache::utils::fdatasync_compat(file_fds_[shard_id]) != 0) {
+    if (!syncDataBlock(shard_id)) {
       throw std::runtime_error("fdatasync failed, errno=" + std::to_string(errno));
     }
   } catch (const std::exception &e) {
@@ -544,7 +568,7 @@ size_t LocalStorageEngine::write(const char *buf, const std::string &hash, uint3
   shard_written_bytes_[shard_id].fetch_add(static_cast<uint64_t>(write_bytes), std::memory_order_relaxed);
 
 #ifndef __APPLE__
-  posix_fadvise(file_fds_[shard_id], offset_bytes, write_bytes, POSIX_FADV_DONTNEED);
+  fadviseDataDontNeed(shard_id, slot_id, write_bytes);
 #endif
 
   return write_bytes;
@@ -555,19 +579,17 @@ size_t LocalStorageEngine::read(char *buf, const std::string &hash, uint32_t len
     return 0;
   }
 
-  // Offline mode: local lookup only.
+  // Offline mode: local lookup only. Single index lookup under the shard read lock,
+  // matching the pre-multi-node single-node hot path (no re-validation overhead).
   if (!online_mode_) {
     const size_t shard_id = getShard(hash);
+    std::shared_lock<std::shared_mutex> lock(*io_locks_[shard_id]);
     const size_t slot_id = caches_[shard_id]->get_offset(hash);
     if (slot_id == static_cast<size_t>(-1)) {
       return 0;
     }
-    std::shared_lock<std::shared_mutex> lock(*io_locks_[shard_id]);
-    if (caches_[shard_id]->get_offset(hash) != slot_id) {
-      return 0;
-    }
-    const size_t offset_bytes = slot_id * block_size_;
-    if (!preadAll(file_fds_[shard_id], buf, static_cast<size_t>(len_bytes), static_cast<off_t>(offset_bytes))) {
+    // Scheme A: read the block back from its stripe files in parallel.
+    if (!readDataBlock(shard_id, slot_id, buf, static_cast<size_t>(len_bytes))) {
       std::fprintf(stderr, "[light_mem error] read: I/O error for hash %s\n", hash.c_str());
       return 0;
     }
@@ -580,8 +602,7 @@ size_t LocalStorageEngine::read(char *buf, const std::string &hash, uint32_t len
     std::shared_lock<std::shared_mutex> lock(*io_locks_[i]);
     const size_t slot_id = caches_[i]->get_offset(hash);
     if (slot_id != static_cast<size_t>(-1)) {
-      const size_t offset_bytes = slot_id * block_size_;
-      if (!preadAll(file_fds_[i], buf, static_cast<size_t>(len_bytes), static_cast<off_t>(offset_bytes))) {
+      if (!readDataBlock(i, slot_id, buf, static_cast<size_t>(len_bytes))) {
         std::fprintf(stderr, "[light_mem error] read: I/O error for hash %s\n", hash.c_str());
         return 0;
       }
@@ -613,8 +634,7 @@ size_t LocalStorageEngine::read(char *buf, const std::string &hash, uint32_t len
   }
 
   if (expected_crc != 0) {
-    const size_t offset_bytes = slot_id * block_size_;
-    if (!preadAll(file_fds_[shard_id], buf, static_cast<size_t>(len_bytes), static_cast<off_t>(offset_bytes))) {
+    if (!readDataBlock(shard_id, slot_id, buf, static_cast<size_t>(len_bytes))) {
       std::fprintf(stderr, "[light_mem error] read: I/O error for hash %s (shard=%zu slot=%zu)\n",
                    hash.c_str(), shard_id, slot_id);
       return 0;

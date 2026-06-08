@@ -43,6 +43,7 @@ public:
   std::weak_ptr<CacheTask> task;
   std::string hash;
   State state{};
+  bool write_data_ready{false};
 };
 
 /**

@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <queue>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -74,6 +75,7 @@ public:
   // Observability: number of in-flight operations targeting a shard.
   uint32_t shardInflight(size_t shard_id) const;
   uint64_t shardWrittenBytes(size_t shard_id) const;
+  uint64_t writtenBytes() const;
 
   // True LRU eviction observability (local disk cache). These counts are local to this node.
   // `shardEvictionCount`: evictions for a single shard.
@@ -99,6 +101,70 @@ private:
   std::optional<size_t> handleExistingLocalDuplicate(size_t shard_id, const std::string &hash, uint32_t data_crc,
                                                      int &result, size_t &slot_id, std::string &evicted_hash,
                                                      bool do_global_dedupe, const std::string &global_key);
+
+  // Fixed-size thread pool servicing concurrent per-stripe disk I/O (scheme A).
+  // Workers pull no-arg tasks from a queue; a caller fans out stripe I/O and waits on a local latch.
+  class IoThreadPool {
+  public:
+    explicit IoThreadPool(size_t threads) {
+      if (threads == 0) {
+        threads = 1;
+      }
+      workers_.reserve(threads);
+      for (size_t i = 0; i < threads; ++i) {
+        workers_.emplace_back([this] { workerLoop(); });
+      }
+    }
+
+    ~IoThreadPool() {
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        stop_ = true;
+      }
+      cv_.notify_all();
+      for (auto &t : workers_) {
+        if (t.joinable()) {
+          t.join();
+        }
+      }
+    }
+
+    IoThreadPool(const IoThreadPool &) = delete;
+    IoThreadPool &operator=(const IoThreadPool &) = delete;
+
+    size_t size() const { return workers_.size(); }
+
+    void submit(std::function<void()> task) {
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        tasks_.push(std::move(task));
+      }
+      cv_.notify_one();
+    }
+
+  private:
+    void workerLoop() {
+      for (;;) {
+        std::function<void()> task;
+        {
+          std::unique_lock<std::mutex> lk(mu_);
+          cv_.wait(lk, [this] { return stop_ || !tasks_.empty(); });
+          if (stop_ && tasks_.empty()) {
+            return;
+          }
+          task = std::move(tasks_.front());
+          tasks_.pop();
+        }
+        task();
+      }
+    }
+
+    std::vector<std::thread> workers_;
+    std::queue<std::function<void()>> tasks_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    bool stop_ = false;
+  };
 
   struct InflightCounter {
     struct Guard {
@@ -164,6 +230,15 @@ private:
   bool preadAll(int fd, void *buf, size_t len, off_t offset);
   bool pwriteAll(int fd, const void *buf, size_t len, off_t offset);
 
+  // Scheme A: striped data block I/O. A block stored at logical slot `slot_id` is split into
+  // `num_stripes_` segments, segment j living in stripe file file_fds_[shard_id][j] at
+  // byte offset `slot_id * stripe_size_`. The segments are issued concurrently through io_pool_
+  // so a single block fans out to multiple files (the unit of parallelism on afs).
+  bool writeDataBlock(size_t shard_id, size_t slot_id, const char *buf, size_t len_bytes);
+  bool readDataBlock(size_t shard_id, size_t slot_id, char *buf, size_t len_bytes);
+  bool syncDataBlock(size_t shard_id);
+  void fadviseDataDontNeed(size_t shard_id, size_t slot_id, size_t len_bytes);
+
   bool readSuperBlockAt(size_t shard_id, off_t off, SuperBlock &sb);
   void writeSuperBlockAt(size_t shard_id, off_t off, SuperBlock sb);
   void ensureSuperBlocksInitialized(size_t shard_id);
@@ -195,8 +270,14 @@ private:
   size_t shard_;
   size_t block_size_;
 
-  std::vector<int> file_fds_;
+  // Scheme A: data striping configuration and the worker pool issuing concurrent stripe I/O.
+  size_t num_stripes_ = 1;                  // Number of stripe sub-files per shard (>=1).
+  size_t stripe_size_ = 0;                  // Bytes of one block segment = block_size_ / num_stripes_.
+  std::unique_ptr<IoThreadPool> io_pool_;   // Shared across shards; sized at construction.
+
   std::vector<int> meta_fds_;
+  // Per-shard data fds: file_fds_[shard][stripe]. With num_stripes_ == 1 this degenerates to one file.
+  std::vector<std::vector<int>> file_fds_;
 
   std::vector<std::shared_ptr<std::shared_mutex>> io_locks_;
   std::vector<std::shared_ptr<LocalCacheIndex>> caches_;

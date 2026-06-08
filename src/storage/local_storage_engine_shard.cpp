@@ -194,6 +194,14 @@ uint64_t LocalStorageEngine::shardWrittenBytes(size_t shard_id) const {
   return shard_written_bytes_[shard_id].load(std::memory_order_relaxed);
 }
 
+uint64_t LocalStorageEngine::writtenBytes() const {
+  uint64_t total = 0;
+  for (size_t i = 0; i < shard_; i++) {
+    total += shardWrittenBytes(i);
+  }
+  return total;
+}
+
 uint64_t LocalStorageEngine::shardEvictionCount(size_t shard_id) const {
   if (shard_id >= shard_) {
     return 0;
